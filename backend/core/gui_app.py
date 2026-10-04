@@ -1,6 +1,7 @@
 import sys
 import customtkinter as ctk
 import pandas as pd
+import numpy as np
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import io
@@ -8,10 +9,12 @@ import threading
 import time
 import os
 from datetime import datetime
+from typing import Optional, List, Dict, Tuple, Any, Union, Callable
 
 from backend.core.db import DatabaseManager
 from backend.core.session_logic import SessionLogic
 from backend.core.web_portal import get_local_ip, generate_qr
+from backend.core.face_core import FaceEngine
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
