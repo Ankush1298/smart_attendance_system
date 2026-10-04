@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS attendance_log (
   INDEX idx_attendance_session_student(session_id,roll_no),
   INDEX idx_attendance_student(roll_no),
   CONSTRAINT fk_attendance_session FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE SET NULL,
-  CONSTRAINT fk_attendance_user FOREIGN KEY(roll_no) REFERENCES users(roll_no) ON DELETE SET NULL ON UPDATE CASCADE ON UPDATE CASCADE
+  CONSTRAINT fk_attendance_user FOREIGN KEY(roll_no) REFERENCES users(roll_no) ON DELETE SET NULL ON UPDATE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS attendance_overrides (

@@ -132,7 +132,7 @@ def _mysql_connection_from_env():
 
 def _ensure_mysql_schema():
     con=_mysql_connection_from_env()
-    schema_path=Path(__file__).resolve().parents[1] / 'database' / 'schema_mysql.sql'
+    schema_path=Path(__file__).resolve().parents[2] / 'database' / 'schema_mysql.sql'
     script=schema_path.read_text(encoding='utf-8')
     # The schema file has a CREATE DATABASE/USE preamble; the connection is already on the target DB.
     statements=[]
