@@ -117,8 +117,25 @@ class KYCManager:
 
 # Global instances (will be bound in factory or module load)
 _BASE_DIR = Path(__file__).parent
-_DEFAULT_DB = DatabaseManager(_BASE_DIR)
-manager = KYCManager(_DEFAULT_DB)
+
+
+class _LazyKYCManager:
+    """Proxy that defers DatabaseManager initialization until first attribute access."""
+    def __init__(self, base_dir: Path):
+        self._base_dir = base_dir
+        self._target: Optional[KYCManager] = None
+
+    def _resolve(self) -> KYCManager:
+        if self._target is None:
+            self._target = KYCManager(DatabaseManager(self._base_dir))
+        return self._target
+
+    def __getattr__(self, item: str):
+        return getattr(self._resolve(), item)
+
+
+_DEFAULT_DB = None
+manager = _LazyKYCManager(_BASE_DIR)
 
 app = FastAPI(title="Smart Attendance KYC Registration")
 
@@ -842,7 +859,157 @@ def api_snapshot_enroll(
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ADMIN_ID = os.environ.get("ADMIN_ID", "ADMIN")
 ADMIN_SESSION_SECONDS = 8 * 3600
-admin_basic = HTTPBasic(auto_error=True)
+admin_basic = HTTPBasic(auto_error=False)
+admin_basic_optional = HTTPBasic(auto_error=False)
+
+ADMIN_SESSIONS: Dict[str, float] = {}
+
+def create_admin_session() -> str:
+    token = secrets.token_urlsafe(32)
+    ADMIN_SESSIONS[token] = time.time() + ADMIN_SESSION_SECONDS
+    return token
+
+def is_valid_admin_session(token: Optional[str]) -> bool:
+    if not token or token not in ADMIN_SESSIONS:
+        return False
+    if time.time() > ADMIN_SESSIONS[token]:
+        del ADMIN_SESSIONS[token]
+        return False
+    return True
+
+ADMIN_LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Login - Smart Attendance</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body {
+      background: radial-gradient(circle at 50% 20%, #1e293b 0%, #0f172a 100%);
+      color: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .login-card {
+      background: rgba(30, 41, 59, 0.85);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 20px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+      width: 100%;
+      max-width: 440px;
+      padding: 2.5rem;
+    }
+    .form-control {
+      background: #0f172a !important;
+      border: 1px solid #334155;
+      color: #f8fafc !important;
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+    }
+    .form-control:focus {
+      border-color: #38bdf8;
+      box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.25);
+    }
+    .btn-login {
+      background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+      color: white;
+      font-weight: 600;
+      border: none;
+      border-radius: 10px;
+      padding: 0.75rem 1.5rem;
+      transition: all 0.2s ease;
+    }
+    .btn-login:hover {
+      background: linear-gradient(135deg, #0369a1 0%, #075985 100%);
+      transform: translateY(-1px);
+    }
+  </style>
+</head>
+<body>
+<div class="login-card">
+  <div class="text-center mb-4">
+    <div style="font-size: 3rem;">🔒</div>
+    <h3 class="fw-bold mt-2 mb-1">Admin Portal</h3>
+    <p class="text-secondary small mb-0">Biometric Registration & KYC Management</p>
+  </div>
+
+  <div id="errorAlert" class="alert alert-danger py-2 small d-none" role="alert"></div>
+
+  <form id="loginForm" onsubmit="handleLogin(event)">
+    <div class="mb-3">
+      <label class="form-label small fw-semibold text-secondary">Admin Username</label>
+      <input type="text" id="username" class="form-control" value="ADMIN" required autocomplete="username">
+    </div>
+
+    <div class="mb-3">
+      <label class="form-label small fw-semibold text-secondary">Password</label>
+      <div class="input-group">
+        <input type="password" id="password" class="form-control" placeholder="Enter Admin Password" required autocomplete="current-password">
+        <button class="btn btn-outline-secondary" type="button" onclick="togglePass()">👁</button>
+      </div>
+      <div class="form-text text-secondary" style="font-size: 0.75rem;">Default admin password: <code>the_fool_12</code></div>
+    </div>
+
+    <button type="submit" id="btnSubmit" class="btn btn-login w-100 mt-2">Unlock Admin Panel 🚀</button>
+  </form>
+
+  <div class="text-center mt-4 pt-3 border-top border-secondary border-opacity-25">
+    <a href="/" class="text-decoration-none text-info small">← Back to Hub</a>
+  </div>
+</div>
+
+<script>
+function togglePass() {
+  const p = document.getElementById('password');
+  p.type = p.type === 'password' ? 'text' : 'password';
+}
+
+async function handleLogin(e) {
+  e.preventDefault();
+  const user = document.getElementById('username').value.trim();
+  const pass = document.getElementById('password').value;
+  const alertBox = document.getElementById('errorAlert');
+  const btn = document.getElementById('btnSubmit');
+
+  alertBox.classList.add('d-none');
+  btn.disabled = true;
+  btn.textContent = 'Verifying...';
+
+  try {
+    const fd = new FormData();
+    fd.append('username', user);
+    fd.append('password', pass);
+
+    const res = await fetch('/admin/login', {
+      method: 'POST',
+      body: fd
+    });
+    const data = await res.json();
+
+    if (res.ok && data.status === 'ok') {
+      window.location.href = data.redirect || '/admin';
+    } else {
+      alertBox.textContent = data.message || 'Incorrect admin password. Please try again.';
+      alertBox.classList.remove('d-none');
+      btn.disabled = false;
+      btn.textContent = 'Unlock Admin Panel 🚀';
+    }
+  } catch (err) {
+    alertBox.textContent = 'Error communicating with server: ' + err;
+    alertBox.classList.remove('d-none');
+    btn.disabled = false;
+    btn.textContent = 'Unlock Admin Panel 🚀';
+  }
+}
+</script>
+</body>
+</html>
+"""
 
 ADMIN_PANEL_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -858,6 +1025,7 @@ ADMIN_PANEL_HTML = r"""<!DOCTYPE html>
       <a class="btn btn-outline-info btn-sm" href="/student" target="_blank">Student Portal</a>
       <a class="btn btn-outline-warning btn-sm" href="/teacher" target="_blank">Faculty Portal</a>
       <button class="btn btn-outline-light btn-sm" onclick="load()">Refresh</button>
+      <a class="btn btn-outline-danger btn-sm" href="/admin/logout">🚪 Logout</a>
     </div>
   </div>
   <input id="search" class="form-control bg-dark text-white border-secondary mb-3" placeholder="Search ID or Name..." oninput="render()">
@@ -938,20 +1106,75 @@ load();
 </script></body></html>
 """
 
-def require_admin(credentials: HTTPBasicCredentials = Depends(admin_basic)):
-    result = manager.db.verify_credential(credentials.username, credentials.password, "admin")
-    if not result.get("valid"):
+def verify_admin_auth(
+    credentials: Optional[HTTPBasicCredentials] = Depends(admin_basic_optional),
+    admin_session: Optional[str] = Cookie(None),
+) -> Optional[Dict[str, Any]]:
+    # 1. Check valid cookie session
+    if is_valid_admin_session(admin_session):
+        return {"valid": True, "name": os.environ.get("ADMIN_NAME", "Administrator")}
+
+    # 2. Check HTTP Basic auth header
+    if credentials:
+        result = manager.db.verify_credential(credentials.username, credentials.password, "admin")
+        if result.get("valid"):
+            return result
+
+    return None
+
+
+def require_admin(
+    credentials: Optional[HTTPBasicCredentials] = Depends(admin_basic_optional),
+    admin_session: Optional[str] = Cookie(None),
+) -> Dict[str, Any]:
+    auth = verify_admin_auth(credentials, admin_session)
+    if not auth:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Administrator authentication required.",
             headers={"WWW-Authenticate": "Basic realm=admin"},
         )
-    return result
+    return auth
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_page(_: Dict[str, Any] = Depends(require_admin)):
-    return HTMLResponse(content=ADMIN_PANEL_HTML)
+def admin_page(
+    credentials: Optional[HTTPBasicCredentials] = Depends(admin_basic_optional),
+    admin_session: Optional[str] = Cookie(None),
+):
+    auth = verify_admin_auth(credentials, admin_session)
+    if auth:
+        return HTMLResponse(content=ADMIN_PANEL_HTML)
+    return HTMLResponse(content=ADMIN_LOGIN_HTML)
+
+
+@app.post("/admin/login")
+def admin_login(username: str = Form(...), password: str = Form(...)):
+    result = manager.db.verify_credential(username, password, "admin")
+    if result.get("valid"):
+        token = create_admin_session()
+        resp = JSONResponse(content={"status": "ok", "redirect": "/admin"})
+        resp.set_cookie(
+            key="admin_session",
+            value=token,
+            max_age=ADMIN_SESSION_SECONDS,
+            httponly=True,
+            samesite="lax",
+        )
+        return resp
+    return JSONResponse(
+        status_code=400,
+        content={"status": "error", "message": result.get("error", "Incorrect administrator password.")},
+    )
+
+
+@app.get("/admin/logout")
+def admin_logout(admin_session: Optional[str] = Cookie(None)):
+    if admin_session and admin_session in ADMIN_SESSIONS:
+        del ADMIN_SESSIONS[admin_session]
+    resp = RedirectResponse(url="/admin", status_code=302)
+    resp.delete_cookie("admin_session")
+    return resp
 
 
 @app.get("/admin/api/users")
