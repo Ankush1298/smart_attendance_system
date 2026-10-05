@@ -15,6 +15,13 @@ from backend.core.db import DatabaseManager
 from backend.core.session_logic import SessionLogic
 from backend.core.web_portal import get_local_ip, generate_qr
 from backend.core.face_core import FaceEngine
+from backend.core.gui_role_views import (
+    get_admin_password,
+    AdminPasswordDialog,
+    TeacherDashboardTab,
+    TeacherReportsTab,
+    SystemConfigTab,
+)
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -66,79 +73,68 @@ class SmartAttendanceApp(ctk.CTk):
         self.geometry("1200x800")
         self.minsize(1050, 680)
 
-        # Root Window Layout: Navigation (fixed width) + Main View (expands full screen)
+        # Role state: starts in Teacher View (Default / Public)
+        self.is_admin = False
+        self.current_role = "teacher"
+        self.nav_buttons: Dict[str, ctk.CTkButton] = {}
+
+        # Root Window Layout: Navigation (fixed width) + Main Container (expands full screen)
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=0)
         self.grid_columnconfigure(1, weight=1)
 
         # Navigation Frame
-        self.nav_frame = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.nav_frame = ctk.CTkFrame(self, width=230, corner_radius=0)
         self.nav_frame.grid(row=0, column=0, sticky="nsew")
-        self.nav_frame.grid_rowconfigure(9, weight=1)
 
-        self.logo_label = ctk.CTkLabel(self.nav_frame, text="Smart Class Pro", font=ctk.CTkFont(size=20, weight="bold"))
-        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+        # Main Container (Right side)
+        self.main_container = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.main_container.grid(row=0, column=1, sticky="nsew", padx=16, pady=16)
+        self.main_container.grid_columnconfigure(0, weight=1)
+        self.main_container.grid_rowconfigure(1, weight=1)
 
-        self.btn_dashboard = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="Dashboard",
-                                           fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                           anchor="w", command=self.show_dashboard)
-        self.btn_dashboard.grid(row=1, column=0, sticky="ew")
+        # Persistent Admin Banner (displayed when Admin Mode is active)
+        self.admin_banner = ctk.CTkFrame(
+            self.main_container,
+            corner_radius=10,
+            fg_color=("#fef3c7", "#451a03"),
+            border_width=1,
+            border_color="#f59e0b"
+        )
+        b_inner = ctk.CTkFrame(self.admin_banner, fg_color="transparent")
+        b_inner.pack(fill="x", padx=14, pady=8)
 
-        self.btn_live = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="📡 Live Attendance",
-                                      fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                      anchor="w", command=self.show_live_attendance)
-        self.btn_live.grid(row=2, column=0, sticky="ew")
+        ctk.CTkLabel(
+            b_inner,
+            text="👑 ADMIN MODE ACTIVE — Full System Privileges & Configurations Unlocked",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("#92400e", "#fbbf24")
+        ).pack(side="left")
 
-        self.btn_timetable = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="Timetable",
-                                           fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                           anchor="w", command=self.show_timetable)
-        self.btn_timetable.grid(row=3, column=0, sticky="ew")
+        ctk.CTkButton(
+            b_inner,
+            text="🔒 Lock / Switch to Teacher View",
+            width=210,
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#ef4444",
+            hover_color="#dc2626",
+            command=self.lock_to_teacher_view
+        ).pack(side="right")
 
-        self.btn_cameras = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="Cameras & Rooms",
-                                         fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                         anchor="w", command=self.show_cameras)
-        self.btn_cameras.grid(row=4, column=0, sticky="ew")
-
-        self.btn_local_registration = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="Local Advanced Registration",
-                                              fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                              anchor="w", command=self.show_local_registration)
-        self.btn_local_registration.grid(row=5, column=0, sticky="ew")
-
-        self.btn_registration = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="Web Portal Link",
-                                              fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                              anchor="w", command=self.show_registration)
-        self.btn_registration.grid(row=6, column=0, sticky="ew")
-
-        self.btn_users = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="👥 Students & Faculty",
-                                       fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                       anchor="w", command=self.show_users)
-        self.btn_users.grid(row=7, column=0, sticky="ew")
-
-        self.btn_override = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="🛡️ Override & Audit",
-                                          fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                          anchor="w", command=self.show_override_audit)
-        self.btn_override.grid(row=8, column=0, sticky="ew")
-
-        self.btn_export = ctk.CTkButton(self.nav_frame, corner_radius=0, height=40, border_spacing=10, text="Export & Reports",
-                                        fg_color="transparent", text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
-                                        anchor="w", command=self.show_export)
-        self.btn_export.grid(row=9, column=0, sticky="ew")
-
-        # Main Content Frame - MUST expand 100% full width and full height
-        self.main_frame = ctk.CTkFrame(self, corner_radius=10, fg_color="transparent")
-        self.main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+        # Main Content Frame - where tab frames are mounted
+        self.main_frame = ctk.CTkFrame(self.main_container, corner_radius=10, fg_color="transparent")
+        self.main_frame.grid(row=1, column=0, sticky="nsew")
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_rowconfigure(0, weight=1)
-        
+
         self.current_frame = None
 
-        self.show_dashboard()
+        # Build initial navigation for Teacher View (Default)
+        self.build_navigation(role="teacher")
+        self.show_teacher_dashboard()
 
-        # Gracefully stop any live camera/preview loop before Tk tears the
-        # window down. Destroying the interpreter while an .after() timer
-        # (update_preview) is still pending on a live camera tab is a
-        # known way to crash Tcl/Tk (fatal abort in _tkinter's callback
-        # dispatch), rather than a clean Python exception.
+        # Gracefully stop any live camera/preview loop before Tk tears down
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self):
@@ -153,18 +149,221 @@ class SmartAttendanceApp(ctk.CTk):
             pass
         self.destroy()
 
+    def build_navigation(self, role="teacher"):
+        """Dynamically constructs the sidebar navigation tree based on active role."""
+        for w in self.nav_frame.winfo_children():
+            w.destroy()
+        self.nav_buttons.clear()
+
+        # Logo Header
+        logo_lbl = ctk.CTkLabel(
+            self.nav_frame,
+            text="Smart Class Pro",
+            font=ctk.CTkFont(size=20, weight="bold")
+        )
+        logo_lbl.pack(padx=20, pady=(20, 6))
+
+        if role == "teacher":
+            # Role Badge
+            badge = ctk.CTkLabel(
+                self.nav_frame,
+                text="👨‍🏫 TEACHER VIEW (PUBLIC)",
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="#38bdf8",
+                fg_color=("gray85", "gray20"),
+                corner_radius=6,
+                padx=10,
+                pady=3
+            )
+            badge.pack(padx=16, pady=(0, 16))
+
+            # Teacher Navigation Buttons
+            btn_t_dash = ctk.CTkButton(
+                self.nav_frame, corner_radius=0, height=40, border_spacing=10,
+                text="📊 Teacher Dashboard", fg_color="transparent",
+                text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
+                anchor="w", command=self.show_teacher_dashboard
+            )
+            btn_t_dash.pack(fill="x")
+            self.nav_buttons["teacher_dashboard"] = btn_t_dash
+
+            btn_live = ctk.CTkButton(
+                self.nav_frame, corner_radius=0, height=40, border_spacing=10,
+                text="📡 Live Class Monitor", fg_color="transparent",
+                text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
+                anchor="w", command=self.show_live_attendance
+            )
+            btn_live.pack(fill="x")
+            self.nav_buttons["live_attendance"] = btn_live
+
+            btn_reports = ctk.CTkButton(
+                self.nav_frame, corner_radius=0, height=40, border_spacing=10,
+                text="📋 Attendance Summaries", fg_color="transparent",
+                text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
+                anchor="w", command=self.show_teacher_reports
+            )
+            btn_reports.pack(fill="x")
+            self.nav_buttons["teacher_reports"] = btn_reports
+
+            # Flexible Spacer
+            spacer = ctk.CTkFrame(self.nav_frame, fg_color="transparent")
+            spacer.pack(fill="both", expand=True)
+
+            # Prominent Admin Panel Lock Button
+            admin_box = ctk.CTkFrame(self.nav_frame, fg_color="transparent")
+            admin_box.pack(fill="x", padx=14, pady=(0, 20))
+
+            ctk.CTkLabel(
+                admin_box,
+                text="System Administration",
+                font=ctk.CTkFont(size=10),
+                text_color="gray"
+            ).pack(anchor="w", pady=(0, 4))
+
+            btn_admin_gate = ctk.CTkButton(
+                admin_box,
+                text="Admin Panel 🔒",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                height=42,
+                fg_color="#0284c7",
+                hover_color="#0369a1",
+                command=self.open_admin_gate
+            )
+            btn_admin_gate.pack(fill="x")
+            self.nav_buttons["admin_gate"] = btn_admin_gate
+
+        else:
+            # Admin Role Badge
+            badge = ctk.CTkLabel(
+                self.nav_frame,
+                text="👑 ADMIN MODE (MASTER)",
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="#fbbf24",
+                fg_color=("#fef3c7", "#78350f"),
+                corner_radius=6,
+                padx=10,
+                pady=3
+            )
+            badge.pack(padx=16, pady=(0, 16))
+
+            # Scrollable Admin Navigation Area
+            admin_nav_scroll = ctk.CTkScrollableFrame(self.nav_frame, fg_color="transparent")
+            admin_nav_scroll.pack(fill="both", expand=True)
+
+            admin_items = [
+                ("admin_dashboard", "📊 Admin Dashboard", self.show_admin_dashboard),
+                ("live_attendance", "📡 Global Live Monitor", self.show_live_attendance),
+                ("timetable", "📅 Timetable & OCR Import", self.show_timetable),
+                ("cameras", "📹 Cameras & Rooms", self.show_cameras),
+                ("local_registration", "🎓 Biometric Registration", self.show_local_registration),
+                ("registration", "📱 KYC Web Portals & QR", self.show_registration),
+                ("users", "👥 Students & Faculty", self.show_users),
+                ("override_audit", "🛡️ Override & Audit", self.show_override_audit),
+                ("export", "📈 Export & Reports", self.show_export),
+                ("system_config", "⚙️ System & DB Settings", self.show_system_config),
+            ]
+
+            for key, label, cmd in admin_items:
+                btn = ctk.CTkButton(
+                    admin_nav_scroll, corner_radius=0, height=38, border_spacing=10,
+                    text=label, fg_color="transparent",
+                    text_color=("gray10", "gray90"), hover_color=("gray70", "gray30"),
+                    anchor="w", command=cmd
+                )
+                btn.pack(fill="x", pady=1)
+                self.nav_buttons[key] = btn
+
+            # Lock button to revert back to Teacher View
+            lock_box = ctk.CTkFrame(self.nav_frame, fg_color="transparent")
+            lock_box.pack(fill="x", padx=14, pady=(10, 16))
+
+            btn_lock = ctk.CTkButton(
+                lock_box,
+                text="🔒 Lock / Switch to Teacher",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                height=38,
+                fg_color="#ef4444",
+                hover_color="#dc2626",
+                command=self.lock_to_teacher_view
+            )
+            btn_lock.pack(fill="x")
+            self.nav_buttons["lock"] = btn_lock
+
+    def open_admin_gate(self):
+        """Prompts the password verification gate modal."""
+        if self.is_admin:
+            self.show_admin_dashboard()
+            return
+        AdminPasswordDialog(self, on_success=self.enable_admin_mode)
+
+    def enable_admin_mode(self):
+        """Unlocks Admin Mode and reveals all administrative features."""
+        self.is_admin = True
+        self.current_role = "admin"
+        self.admin_banner.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.build_navigation(role="admin")
+        self.show_admin_dashboard()
+        messagebox.showinfo(
+            "Admin Mode Active",
+            "Administrator access verified!\n\nAll system configurations, camera mapping, "
+            "biometric registration, and timetable OCR tools are now unlocked."
+        )
+
+    def lock_to_teacher_view(self):
+        """Locks administrative features and reverts to the public Teacher View."""
+        self.is_admin = False
+        self.current_role = "teacher"
+        self.admin_banner.grid_forget()
+        self.build_navigation(role="teacher")
+        self.show_teacher_dashboard()
+        messagebox.showinfo(
+            "Teacher View Activated",
+            "Administrative features are now locked.\nReturned to default Teacher View."
+        )
 
     def select_frame_by_name(self, name):
-        # Update button colors
-        self.btn_dashboard.configure(fg_color=("gray75", "gray25") if name == "dashboard" else "transparent")
-        self.btn_live.configure(fg_color=("gray75", "gray25") if name == "live_attendance" else "transparent")
-        self.btn_timetable.configure(fg_color=("gray75", "gray25") if name == "timetable" else "transparent")
-        self.btn_cameras.configure(fg_color=("gray75", "gray25") if name == "cameras" else "transparent")
-        self.btn_local_registration.configure(fg_color=("gray75", "gray25") if name == "local_registration" else "transparent")
-        self.btn_registration.configure(fg_color=("gray75", "gray25") if name == "registration" else "transparent")
-        self.btn_users.configure(fg_color=("gray75", "gray25") if name == "users" else "transparent")
-        self.btn_override.configure(fg_color=("gray75", "gray25") if name == "override_audit" else "transparent")
-        self.btn_export.configure(fg_color=("gray75", "gray25") if name == "export" else "transparent")
+        """Highlights the active navigation button across current role view."""
+        for btn_key, btn in self.nav_buttons.items():
+            if btn_key == name:
+                btn.configure(fg_color=("gray75", "gray25"))
+            elif btn_key not in ("admin_gate", "lock"):
+                btn.configure(fg_color="transparent")
+
+    def show_teacher_dashboard(self):
+        self.select_frame_by_name("teacher_dashboard")
+        if self.current_frame:
+            if hasattr(self.current_frame, 'stop_camera'):
+                self.current_frame.stop_camera()
+            self.current_frame.destroy()
+
+        self.current_frame = TeacherDashboardTab(
+            self.main_frame, self.db, self.session_logic,
+            on_navigate_live=self.show_live_attendance
+        )
+        self.current_frame.grid(row=0, column=0, sticky="nsew")
+
+    def show_teacher_reports(self):
+        self.select_frame_by_name("teacher_reports")
+        if self.current_frame:
+            if hasattr(self.current_frame, 'stop_camera'):
+                self.current_frame.stop_camera()
+            self.current_frame.destroy()
+
+        self.current_frame = TeacherReportsTab(self.main_frame, self.db)
+        self.current_frame.grid(row=0, column=0, sticky="nsew")
+
+    def show_system_config(self):
+        self.select_frame_by_name("system_config")
+        if self.current_frame:
+            if hasattr(self.current_frame, 'stop_camera'):
+                self.current_frame.stop_camera()
+            self.current_frame.destroy()
+
+        self.current_frame = SystemConfigTab(self.main_frame, self.db, port=self.port)
+        self.current_frame.grid(row=0, column=0, sticky="nsew")
+
+    def show_admin_dashboard(self):
+        self.show_dashboard()
 
     def show_override_audit(self):
         self.select_frame_by_name("override_audit")
@@ -190,8 +389,11 @@ class SmartAttendanceApp(ctk.CTk):
         self.current_frame.grid(row=0, column=0, sticky="nsew")
 
     def show_dashboard(self):
-        self.select_frame_by_name("dashboard")
-        if self.current_frame: self.current_frame.destroy()
+        self.select_frame_by_name("admin_dashboard")
+        if self.current_frame:
+            if hasattr(self.current_frame, 'stop_camera'):
+                self.current_frame.stop_camera()
+            self.current_frame.destroy()
         
         self.current_frame = ctk.CTkScrollableFrame(self.main_frame, fg_color="transparent")
         self.current_frame.grid(row=0, column=0, sticky="nsew")
@@ -448,10 +650,39 @@ class SmartAttendanceApp(ctk.CTk):
             if filepath:
                 self._import_timetable(filepath)
 
+        def import_csv_direct():
+            filepath = filedialog.askopenfilename(filetypes=[
+                ("CSV Timetable", "*.csv"),
+                ("All Files", "*.*")
+            ])
+            if not filepath:
+                return
+            try:
+                df = pd.read_csv(filepath)
+                required = {"Day", "StartTime", "EndTime", "Subject", "TeacherID", "RoomID"}
+                missing = required - set(df.columns)
+                if missing:
+                    messagebox.showerror("Invalid CSV", f"CSV is missing required columns:\n{', '.join(sorted(missing))}")
+                    return
+                import backend.core.timetable_parser as tparser
+                created = tparser.ensure_rooms(self.db, df)
+                self.db.load_timetable_from_df(df)
+                if hasattr(self, "session_logic") and self.session_logic:
+                    self.session_logic.invalidate_timetable_cache()
+                msg = f"Timetable CSV imported successfully!\nLoaded {len(df)} rows from {os.path.basename(filepath)}."
+                if created:
+                    msg += f"\n\nCreated {len(created)} new room(s): {', '.join(created[:6])}"
+                messagebox.showinfo("Timetable Imported", msg)
+                self.show_timetable()
+            except Exception as exc:
+                messagebox.showerror("Import Error", f"Failed to import timetable CSV:\n{exc}")
+
         top_bar = ctk.CTkFrame(self.current_frame, fg_color="transparent")
         top_bar.pack(fill="x", pady=(0, 14))
-        ctk.CTkButton(top_bar, text="📤 Upload New Timetable (PDF / CSV / Excel)",
-                      command=upload_file, fg_color="#059669", hover_color="#047857").pack(side="left")
+        ctk.CTkButton(top_bar, text="📤 Upload & OCR Timetable (PDF / Spreadsheets)",
+                      command=upload_file, fg_color="#059669", hover_color="#047857").pack(side="left", padx=(0, 8))
+        ctk.CTkButton(top_bar, text="📥 Timetable CSV Importer (import_timetable.py)",
+                      command=import_csv_direct, fg_color="#0284c7", hover_color="#0369a1").pack(side="left")
 
         tt = self.db.get_timetable()
         if not tt:
@@ -1907,6 +2138,10 @@ class LiveAttendanceTab(ctk.CTkFrame):
         if ret:
             self._process_frame_faces(frame, force_instant=True)
             messagebox.showinfo("Instant Scan Complete", f"Processed current frame.\nTotal Students Present: {len(self.present_students)}")
+
+    def stop_camera(self):
+        """Safely stops live streaming when navigating away from LiveAttendanceTab."""
+        self.stop_session()
 
     def stop_session(self):
         self._running = False
