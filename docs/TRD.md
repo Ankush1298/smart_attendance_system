@@ -33,9 +33,11 @@ This is a solid single-college attendance product, but it is not yet structured 
 | D6 | **Async jobs with a worker queue** (Celery or Arq/RQ) for emails/SMS, PDF generation, imports, report exports, embeddings. | Keep API responsive. |
 | D7 | **Object storage (S3-compatible / MinIO on-prem)** for documents, PDFs, uploads. | No files in DB or web server disk. |
 | D8 | **Frontend: React + TypeScript + Vite PWA** replacing the vanilla admin UI incrementally (module by module, same REST API). | Component reuse, maintainability, mobile/PWA. Existing UI keeps working until each page is replaced. |
-| D9 | **Assistant = RAG + tool use over the same internal APIs** with an LLM provider (Claude API) behind a provider interface. | Grounded answers, same permission model, swappable model. |
+| D9 | **Assistant = RAG + tool use over the same internal APIs, running on a self-hosted open-weight LLM inside the institution's own infrastructure.** No student/staff data, prompts, documents or embeddings leave the institution. A provider interface still exists so the model can be swapped. | Binding requirement: *no data may leave the university*. Grounded answers, same permission model. |
 | D10 | **OpenAPI-first contract**; generated TypeScript client. | Frontend/backend decoupling. |
-| D11 | **12-factor config, Docker images, Docker Compose for on-prem; Kubernetes optional later.** | Reproducible deployment. |
+| D11 | **Deployment-agnostic: 12-factor config, Docker images; Docker Compose for a single server, Kubernetes optional.** The same images run on an on-prem server or in a private cloud/VPC chosen by the college; storage and compute are sized per college (§6.2). | Hosting is decided per customer. |
+| D12 | **Single-tenant deployment now, tenant-ready by design.** Every business table carries `institution_id` from day one, config and branding are per institution, and no code assumes one college. Launch = one college per deployment (own DB, own storage, own LLM server); a shared multi-tenant "platform" edition is a later phase. | Start with one college, expand to several without a rewrite or migration of the schema. |
+| D13 | **Everything vendor-specific is an adapter, chosen by config** (payment gateway, SMS/WhatsApp, email, LLM, embeddings, storage). Nothing is hard-wired until the college decides. Self-hosted/local implementations are the default (SMTP relay, MinIO, local LLM). | Providers are undecided; data-residency rule. |
 
 ## 3. Target architecture
 
@@ -59,7 +61,7 @@ This is a solid single-college attendance product, but it is not yet structured 
    ┌───────────┴──┐   ┌──────┴────────┐   ┌─────────────────┴──────────┐
    │ Attendance   │   │ Job workers   │   │ Assistant service           │
    │ vision worker│   │ (email, PDF,  │   │ (RAG, tools, guardrails)    │
-   │ cameras      │   │ imports)      │   │  → LLM provider API         │
+   │ cameras      │   │ imports)      │   │  → LOCAL LLM server         │
    └──────────────┘   └───────────────┘   └─────────────────────────────┘
 ```
 
@@ -174,34 +176,46 @@ user msg → authN/Z → input guard → router (intent: faq | personal-data | a
    → stream to UI → log + feedback widget
 ```
 
-### 5.3 Provider and cost control
-- Provider interface (`LLMClient`, `Embedder`) so models can change; default Claude models via the Anthropic API; embeddings from a hosted or local model (e.g. bge/e5, multilingual).
-- Caching: semantic cache for public FAQ answers (TTL, invalidated on KB change); prompt caching for the static system prompt and tool schemas.
-- Per-user and per-day token budgets; circuit breaker → degrade to FAQ search + ticket form if provider fails.
-- Data handling: send only the minimum personal data needed; no raw face data or credentials ever; provider contract with no-training and defined retention; option for self-hosted model for on-prem-only institutions (quality trade-off documented).
+### 5.3 Self-hosted models (data never leaves the institution)
+- **Policy:** no calls to any external AI API. Network egress from the assistant, vector DB and worker hosts is blocked by default (allow-list only for OS/package mirrors during maintenance); this is verified in the security checklist.
+- **Serving:** an inference server (vLLM, or llama.cpp/Ollama for small installs) exposing an OpenAI-compatible endpoint on the internal network. Application code talks only to the `LLMClient` / `Embedder` interfaces.
+- **Models (open-weight, commercially usable licences; final choice by benchmark on the college's eval set):**
+  - Chat/answering: an instruction-tuned model in the 7–14B class (quantised) for small installs, 30–70B class on larger GPUs; a small 1–3B model for intent routing.
+  - Embeddings and reranker: multilingual open models (e.g. bge-m3 / multilingual-e5, bge-reranker).
+  - Speech (later, voice channel): Whisper-class models, also local.
+- **Hardware tiers** (see §6.2): Tier S can run a 7–8B quantised model on one 16–24 GB GPU (or CPU-only with low concurrency and higher latency); Tier M/L add GPU capacity or more replicas. Capacity is sized from measured tokens/s and the target concurrent chats.
+- **Quality trade-off, stated plainly:** smaller local models are weaker at reasoning and non-English languages than frontier hosted models. We compensate with strict retrieval grounding, short fixed answer templates for common cases, deterministic tools for anything numeric (attendance, fees), a larger eval set, and mandatory "not found → ticket" behaviour. The eval harness gates every model or prompt change.
+- **Cost/performance control:** per-user rate limits, request queue with back-pressure, semantic cache for public FAQ answers, prompt/KV-cache reuse of the static system prompt and tool schemas, graceful degradation to FAQ search + ticket form if the model server is down or saturated.
+- **Data handling:** chat logs, KB, embeddings and eval data stay in the institution's DB/storage; logs are PII-redacted and retained ≤ 90 days; no telemetry leaves the network. Face embeddings and credentials are never given to the LLM.
 
 ### 5.4 Languages
 Multilingual embeddings + model instruction to answer in the user's language; KB can hold translated variants; quality tested per language in the eval set.
 
 ### 5.5 Vector store
-Start with **pgvector or Qdrant** alongside MySQL (MySQL 8 has no mature ANN index). Choose Qdrant (single container) if staying on MySQL; pgvector if migrating the OLTP DB to PostgreSQL.
+Self-hosted only. Use **Qdrant** (single container, on-prem) while the OLTP DB is MySQL; pgvector if the OLTP DB later moves to PostgreSQL. Both run inside the institution's network.
 
 ## 6. Platform and infrastructure
 
 ### 6.1 Environments
 `local` (Docker Compose) → `staging` (prod-like, anonymised data) → `production`. Config via environment variables; per-env secrets in a secret manager (or sealed `.env` on-prem).
 
-### 6.2 Deployment topology (initial, ~5k users)
-| Component | Spec (starting point) |
-|---|---|
-| API | 2 × (2 vCPU, 4 GB), stateless, behind proxy |
-| Workers | 1–2 × (2 vCPU, 4 GB) |
-| Vision workers | 1 per ~10–12 rooms; 4 vCPU, 8 GB each (GPU optional) |
-| MySQL 8 | 4 vCPU, 16 GB, SSD; primary + replica |
-| Redis | 2 GB |
-| Object storage | S3/MinIO, versioned |
-| Vector DB | 2 vCPU, 4 GB |
-Scale API/workers horizontally; keep the DB as the first thing to size up. Cloud and on-prem are both supported by the same Docker images.
+### 6.2 Deployment topology and sizing profiles
+Hosting is the college's choice and is not fixed in advance: **on-prem server(s), a private cloud/VPC, or a hybrid** (e.g. cameras and vision worker on campus, the rest in a private cloud). Because no data may leave the university, any cloud used must be one the institution controls and that satisfies its data-residency rule; the assistant's LLM server always runs inside that boundary. Storage (DB, object storage, backups) is provisioned by demand and grows with usage.
+
+Sizing is **profile-based and flexible**, driven by the college's numbers (students, staff, rooms/cameras, peak concurrency). Starting points, to be validated by load tests:
+
+| Component | Tier S (≈ ≤ 2k users, ≤ 20 rooms) | Tier M (≈ 2–10k users, ≤ 100 rooms) | Tier L (≈ 10k+ users / multi-campus) |
+|---|---|---|---|
+| API | 1–2 × (2 vCPU, 4 GB) | 2–4 × (4 vCPU, 8 GB) | autoscaled pool |
+| Workers (jobs) | 1 × (2 vCPU, 4 GB) | 2 × (4 vCPU, 8 GB) | autoscaled pool |
+| Vision workers | 1 × (4 vCPU, 8 GB) per ~10–12 rooms; GPU optional | add workers per building | per-campus edge nodes |
+| MySQL 8 | 1 node, 4 vCPU, 16 GB, SSD | primary + replica | primary + replicas / managed cluster |
+| Redis | 1–2 GB | 4 GB | HA pair |
+| Object storage | MinIO, expandable volume | MinIO distributed | S3-compatible cluster |
+| Vector DB | shared host | dedicated 2 vCPU, 8 GB | dedicated cluster |
+| LLM server | 1 GPU (16–24 GB) or CPU-only low concurrency | 1–2 GPUs (24–48 GB) | multiple GPUs / multiple replicas |
+
+Scaling rules: API and workers scale horizontally; storage grows by volume expansion; DB is sized up first; GPU/LLM capacity is added when chat p95 latency or queue depth crosses its threshold. A **capacity calculator sheet** (students × requests/day, rooms × cameras, chat sessions × tokens) is part of the onboarding kit so each college is quoted from its own numbers.
 
 ### 6.3 Reliability
 - Backups: nightly full + binlog PITR, 30-day retention, **monthly restore drill**; object storage versioning; encrypted offsite copy.
@@ -210,7 +224,7 @@ Scale API/workers horizontally; keep the DB as the first thing to size up. Cloud
 - Peak events (fee deadline, result day): rate limits, queue-based processing, cached read models, pre-scaling playbook.
 
 ### 6.4 Database path
-Stay on MySQL 8 in phases 0–2 (no forced migration). Decide on PostgreSQL at the end of phase 1 using criteria: need for pgvector/full-text/JSONB-heavy workflows vs. operational familiarity. Using SQLAlchemy + Alembic keeps this switch cheap.
+Stay on MySQL 8 in phases 0–2 (no forced migration); the schema is tenant-ready (`institution_id`, D12). Decide on PostgreSQL at the end of phase 1 using criteria: need for pgvector/full-text/JSONB-heavy workflows vs. operational familiarity. Using SQLAlchemy + Alembic keeps this switch cheap.
 
 ### 6.5 Observability
 Structured JSON logs (existing logger extended) with `request_id`, `user_id`, `module`; metrics (Prometheus) and dashboards (Grafana); tracing (OpenTelemetry); error tracking (Sentry); alerting on SLO burn, queue depth, camera offline, payment webhook failures, bot error/negative-feedback spikes.
@@ -257,7 +271,8 @@ Coverage target: ≥ 80 % lines on domain/services, 100 % of endpoints in authZ 
 - Biometric data: explicit opt-in, opt-out path with alternative attendance method, separate encryption key, access-logged.
 - Minors/parents: guardian consent and guardian-scoped views.
 - Audit logs immutable (append-only, hash-chained optional) and retained ≥ 3 years; access reviews each semester.
-- LLM governance: data-flow diagram, provider DPA, prompt/response retention ≤ 90 days with redaction, human review of flagged conversations.
+- LLM governance: all inference on-premise (no third-party processor for AI), egress blocked and tested, data-flow diagram, prompt/response retention ≤ 90 days with redaction, human review of flagged conversations.
+- Payment and SMS/WhatsApp are the only integrations that necessarily send limited data out (payment hosted checkout, message text); they are optional adapters, minimised (no academic data in messages), and each needs an explicit institutional approval before enabling.
 
 ## 12. Delivery plan (engineering view)
 
@@ -268,6 +283,7 @@ Coverage target: ≥ 80 % lines on domain/services, 100 % of endpoints in authZ 
 | **2 Academics & exams** | 8–10 | Marks, assessments, exam cell, hall tickets with eligibility, results, revaluation, parent portal, attendance leave + shortage alerts, analytics v1. |
 | **3 Campus services** | 8 | Library, hostel, transport, HR leave, WhatsApp channel, SMS, more request types, proactive nudges. |
 | **4 Scale & intelligence** | ongoing | Read replica/reporting store, risk scoring, admissions, multilingual, voice, optional PostgreSQL move, HA tuning. |
+| **5 Multi-college platform** | after 1st college is stable | Tenant provisioning, per-tenant branding/config, super-tenant console, billing/licensing, isolation tests (cross-tenant access must be impossible), upgrade/rollout tooling across tenants. |
 
 Suggested team: 1 tech lead, 2 backend, 2 frontend, 1 ML/AI engineer, 1 DevOps (part-time), 1 QA, 1 product/UX, plus department "knowledge owners". Can be run by a smaller team over a longer timeline (pilot-first).
 
@@ -280,14 +296,25 @@ Suggested team: 1 tech lead, 2 backend, 2 frontend, 1 ML/AI engineer, 1 DevOps (
 | LLM hallucination / prompt injection from uploaded docs | Grounding checks, tool permissions bound to user, treat KB text as data, eval suite, human-review queue. |
 | Payment edge cases (double debit, webhook loss) | Idempotency, reconciliation job, manual-resolve console. |
 | Data volume (recognition events) | Partitioning/archival of `recognition_events`/`scan_logs`, retention policy, summary tables. |
-| Vendor lock-in (LLM, SMS, payment) | Provider interfaces, config-driven selection. |
+| Vendor lock-in (SMS, payment, storage) | Adapters, config-driven selection (D13); providers not yet chosen. |
+| Local LLM quality below hosted frontier models | Strong grounding + deterministic tools, narrower bot scope at launch, larger eval set, model benchmarking per release, option to enlarge GPU tier. |
+| GPU cost/availability for small colleges | CPU-only/quantised small-model profile with FAQ-first behaviour; scale GPUs only if demand justifies. |
 | Underestimated ops load on small team | Managed services where allowed, runbooks, automated backups/restores, alerting from day one. |
 
-## 14. Decisions needed from you
-1. Hosting: on-prem vs cloud, budget band, data-residency rule.
-2. Single college vs multiple (multi-tenant now or later).
-3. Payment gateway, SMS/WhatsApp provider.
-4. LLM policy: hosted API acceptable for student data, or must stay self-hosted?
-5. Team size and timeline expectation (determines phase scoping).
-6. Priority order of modules after phase 1 (fees vs exams vs library …).
-7. Target scale: students/staff counts, peak concurrency, number of rooms/cameras.
+## 14. Decisions (recorded) and what is still open
+
+| # | Question | Decision | Consequence |
+|---|---|---|---|
+| 1 | One college or several? | **Start with one; later several, launched as a full product/startup.** | Tenant-ready schema and config from day one (D12); one deployment per college at launch; a hosted multi-tenant platform edition is phase 5. |
+| 2 | Hosting | **Flexible: cloud or on-prem/storage-based, per demand.** | Deployment-agnostic containers (D11); sizing profiles (§6.2). |
+| 3 | Student data to hosted AI? | **No. No data may leave the university.** | Self-hosted LLM, embeddings and vector DB (D9, §5.3); egress blocked. |
+| 4 | Payment / SMS providers | **Undecided.** | Adapter interfaces (D13); a sandbox/mock provider ships first; decide before phase 1 fee go-live. |
+| 5 | Scale (students, staff, rooms, cameras) | **Flexible, per college.** | Tiered profiles and capacity calculator (§6.2). |
+
+**Still open (not blocking phase 0):**
+1. Which GPU budget the first college can provide for the assistant (determines model size and languages at launch).
+2. Languages required at launch.
+3. Payment gateway and SMS/WhatsApp provider (needed before phase 1 fee go-live).
+4. Team size and timeline.
+5. Module priority after phase 1.
+6. Licensing/commercial model for the later multi-college product (affects tenant isolation level: shared DB with `institution_id` vs. database-per-tenant).

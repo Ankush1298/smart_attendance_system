@@ -42,7 +42,7 @@ Attendance stays the "hero" feature and becomes the first module of a larger pla
 - Replacing statutory/government portals (university exam registration, AICTE/NAAC submissions) — we export data for them.
 - Full LMS (video lectures, rich course authoring). Only basic course material sharing and assignments.
 - Online payment gateway *building* — we integrate a provider (Razorpay/Stripe/PayU).
-- Multi-college SaaS tenancy (design allows it later; v1 is a single institution).
+- Multi-college SaaS in v1. Launch is a single institution; the product is **designed tenant-ready** so several colleges can be offered later (phase 5).
 - Autonomous decisions on grades, discipline or admissions by the bot. The assistant informs and routes; humans decide.
 
 ## 4. Users and roles
@@ -67,6 +67,8 @@ Existing roles are kept; new ones added.
 Permissions are role- and department-scoped (an HOD sees only their department).
 
 ## 5. Product principles
+
+0. **Data stays inside the university.** No student, staff or chat data is sent to outside AI or analytics services. The assistant runs on the college's own servers.
 
 1. **Answer first, form second.** The student asks in plain language; the bot answers or starts the request. Forms are the fallback.
 2. **Official sources only.** The bot answers from college-approved documents and live system data, never from guesses; it cites the source and its "last updated" date.
@@ -201,6 +203,7 @@ Department staff upload/edit FAQs and documents (PDF, DOCX, web page) with owner
 | 2. Academics & exams | 8–10 wks | Marks, assignments, exam cell, hall tickets, results, parent portal, alerts. | One full exam cycle run on the system. |
 | 3. Campus services | 8 wks | Library, hostel, transport, HR/leave, wider request catalogue, WhatsApp channel. | All departments onboarded. |
 | 4. Analytics & optimisation | ongoing | Risk analytics, admissions, regional languages, voice. | Targets in §3 reached. |
+| 5. Multi-college platform | after first college is stable | Tenant provisioning, per-college branding/config, central console, licensing. | Second college onboarded without code changes. |
 
 Pilot first in one department/year; run old (paper) and new in parallel for one cycle; train staff; appoint a "knowledge owner" per department.
 
@@ -214,15 +217,29 @@ Pilot first in one department/year; run old (paper) and new in parallel for one 
 | Privacy / biometric concerns | Consent flow, clear retention policy, DPO contact, minimal data, access logs. |
 | Scope creep ("ERP for everything") | Strict phase gates; request engine lets new services be added by config, not code. |
 | Single-server architecture limits | TRD defines the path from the current single-process to scalable deployment. |
-| LLM cost / outages | Caching, cheaper model for routing, per-user rate limits, fallback to FAQ search and ticket form. |
+| Local (self-hosted) AI is less capable than hosted models | Narrow, well-grounded bot scope at launch; deterministic lookups for numbers; larger test set; scale GPU only if demand justifies; always fall back to FAQ search and ticket form. |
+| AI hardware cost for small colleges | Light CPU/quantised profile with FAQ-first behaviour; GPU tier optional. |
 
-## 12. Open questions (need your decisions)
+## 12. Decisions (recorded) and open questions
 
-1. One college or a **group of colleges** (multi-tenant)? Affects data model now.
-2. Hosting: **on-premise server**, or cloud (and which region/budget)?
-3. Which existing systems must we integrate with (university portal, accounting software, biometric/RFID gates)?
-4. Payment provider and fee complexity (number of fee heads, scholarships).
-5. Languages needed at launch.
-6. Do parents get logins in phase 1?
-7. Approx. numbers: students, staff, concurrent peak — to size infrastructure.
-8. Who owns content for the bot in each department?
+| # | Question | Decision |
+|---|---|---|
+| 1 | One college or several? | Start with **one**; later expand to several, launching as a full product. Design is tenant-ready from day one. |
+| 2 | Hosting | **Flexible**: cloud (institution-controlled) or on-prem/storage-based, chosen per demand. |
+| 3 | Student data to hosted AI? | **No. No data may leave the university.** The assistant uses self-hosted models only. |
+| 4 | Payment / SMS providers | **Not decided yet.** Built as pluggable adapters; a test/sandbox provider first; choice needed before fee go-live. |
+| 5 | Scale | **Flexible per college** (sized from its student/staff/room/camera numbers). |
+
+### Product impact of these decisions
+- **Assistant scope at launch is deliberately focused**: FAQs, personal lookups (attendance, fees, timetable, request status), starting the top requests, and human handoff. Broader open-ended reasoning and multiple languages grow as the college provides GPU capacity and as local models are evaluated.
+- **Payments and SMS/WhatsApp are optional modules**: the ERP is fully usable (fees shown, receipts generated, in-app and email notices) before those providers are chosen; online payment and SMS are switched on when approved.
+- **Per-college onboarding kit**: data-import templates, capacity calculator, knowledge-owner checklist, training plan.
+- **Later product edition**: multi-college platform with per-college branding, configuration and isolated data (phase 5).
+
+### Still open
+1. Languages needed at launch.
+2. GPU/server budget the first college can provide.
+3. Payment gateway and SMS/WhatsApp provider.
+4. Whether parents get logins in phase 1.
+5. Who owns bot content in each department.
+6. Commercial/licensing model for the multi-college product.
