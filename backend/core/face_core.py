@@ -14,6 +14,29 @@ try:
 except ImportError:
     INSIGHTFACE_AVAILABLE = False
 
+FACE_MODEL_NAME = "buffalo_sc"
+REQUIRED_MODEL_FILES = ("det_500m.onnx", "w600k_mbf.onnx")
+
+
+def model_info(model_dir) -> dict:
+    """Which face model files exist (and their short sha256) - the model version is part of
+    every embedding's identity, so a silent model swap is visible in the readiness page."""
+    import hashlib
+    base = Path(model_dir) / "models" / FACE_MODEL_NAME
+    files, missing = {}, []
+    for name in REQUIRED_MODEL_FILES:
+        f = base / name
+        if f.is_file():
+            h = hashlib.sha256()
+            with f.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            files[name] = h.hexdigest()[:12]
+        else:
+            missing.append(name)
+    return {"name": FACE_MODEL_NAME, "dir": str(base), "files": files, "missing": missing}
+
+
 class FaceEngine:
     DEFAULT_THRESHOLD  = 0.50
     UPLIFTED_THRESHOLD = 0.50
@@ -46,7 +69,7 @@ class FaceEngine:
                 return
             try:
                 self._app = FaceAnalysis(
-                    name="buffalo_sc",
+                    name=FACE_MODEL_NAME,
                     root=self.model_dir,
                     providers=["CPUExecutionProvider"],
                 )

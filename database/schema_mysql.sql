@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
   roll_no VARCHAR(100) PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
   role ENUM('student','teacher','admin') NOT NULL DEFAULT 'student',
-  embedding LONGBLOB NOT NULL,
+  embedding LONGBLOB NULL,
   multi_embeddings LONGBLOB NULL,
   mesh_path VARCHAR(500) NULL,
   registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS authorized_credentials (
   id_number VARCHAR(100) PRIMARY KEY,
   password VARCHAR(500) NOT NULL,
-  role ENUM('student','teacher','admin') NOT NULL,
+  role VARCHAR(20) NOT NULL,
   allocated_name VARCHAR(255) NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -165,4 +165,126 @@ CREATE TABLE IF NOT EXISTS teacher_attendance (
   UNIQUE KEY uq_teacher_attendance_session(session_id, teacher_id),
   INDEX idx_teacher_attendance_date(date),
   CONSTRAINT fk_teacher_attendance_session FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+
+-- ===== Schema v3: configuration, cameras, sections, event/audit tables =====
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INT PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  setting_key VARCHAR(100) PRIMARY KEY,
+  setting_value VARCHAR(500) NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sections (
+  section_id VARCHAR(100) PRIMARY KEY,
+  section_name VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS student_sections (
+  section_id VARCHAR(100) NOT NULL,
+  roll_no VARCHAR(100) NOT NULL,
+  PRIMARY KEY (section_id, roll_no),
+  INDEX idx_student_sections_roll(roll_no),
+  CONSTRAINT fk_ss_section FOREIGN KEY(section_id) REFERENCES sections(section_id) ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_ss_user FOREIGN KEY(roll_no) REFERENCES users(roll_no) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS cameras (
+  camera_id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  camera_type VARCHAR(20) NOT NULL DEFAULT 'usb',
+  source VARCHAR(1000) NOT NULL DEFAULT '',
+  room_id VARCHAR(100) NULL,
+  enabled TINYINT NOT NULL DEFAULT 1,
+  status VARCHAR(20) NOT NULL DEFAULT 'UNKNOWN',
+  last_ok_at DATETIME NULL,
+  last_error VARCHAR(500) NULL,
+  reconnect_count INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_camera_name(name),
+  INDEX idx_camera_room(room_id),
+  CONSTRAINT fk_camera_room FOREIGN KEY(room_id) REFERENCES rooms(room_id) ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_events (
+  event_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  session_id VARCHAR(150) NOT NULL,
+  event_type VARCHAR(40) NOT NULL,
+  from_state VARCHAR(30) NULL,
+  to_state VARCHAR(30) NULL,
+  detail VARCHAR(500) NULL,
+  occurred_at DATETIME(3) NOT NULL,
+  INDEX idx_session_events(session_id, occurred_at),
+  CONSTRAINT fk_session_events_session FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS recognition_events (
+  event_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  session_id VARCHAR(150) NOT NULL,
+  roll_no VARCHAR(100) NOT NULL,
+  role VARCHAR(30) NOT NULL,
+  camera_id INT NULL,
+  detected_at DATETIME(3) NOT NULL,
+  confidence DOUBLE NULL,
+  UNIQUE KEY uq_recognition(session_id, roll_no, detected_at),
+  INDEX idx_recognition_session(session_id, role),
+  CONSTRAINT fk_recognition_session FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_unmeasurable (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  session_id VARCHAR(150) NOT NULL,
+  started_at DATETIME(3) NOT NULL,
+  ended_at DATETIME(3) NULL,
+  reason VARCHAR(255) NULL,
+  UNIQUE KEY uq_unmeasurable(session_id, started_at),
+  CONSTRAINT fk_unmeasurable_session FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS teacher_flags (
+  flag_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  session_id VARCHAR(150) NOT NULL,
+  teacher_id VARCHAR(100) NOT NULL,
+  flag_type VARCHAR(40) NOT NULL,
+  started_at DATETIME(3) NOT NULL,
+  ended_at DATETIME(3) NULL,
+  minutes DOUBLE NOT NULL DEFAULT 0,
+  UNIQUE KEY uq_teacher_flag(session_id, flag_type, started_at),
+  CONSTRAINT fk_teacher_flags_session FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_student_summary (
+  session_id VARCHAR(150) NOT NULL,
+  roll_no VARCHAR(100) NOT NULL,
+  present_minutes DOUBLE NOT NULL DEFAULT 0,
+  measurable_minutes DOUBLE NOT NULL DEFAULT 0,
+  percentage DOUBLE NULL,
+  status VARCHAR(30) NOT NULL,
+  computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (session_id, roll_no),
+  CONSTRAINT fk_summary_session FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS timetable_drafts (
+  draft_id CHAR(32) PRIMARY KEY,
+  filename VARCHAR(255) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  rows_json LONGTEXT NOT NULL,
+  issues_json LONGTEXT NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'draft'
+);
+
+CREATE TABLE IF NOT EXISTS timetable_archive (
+  archive_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  reason VARCHAR(255) NULL,
+  data_json LONGTEXT NOT NULL
 );

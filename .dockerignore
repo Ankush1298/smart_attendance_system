@@ -7,3 +7,4 @@ __pycache__
 .runtime_certs
 *.log
 test_*.py
+node_modules

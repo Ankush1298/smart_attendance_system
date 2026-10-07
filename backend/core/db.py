@@ -1,10 +1,14 @@
 import base64
 import hashlib
 import hmac
+import io
+import logging
 import os
 import pickle
 import secrets
 import re
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -15,7 +19,32 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-SCHEMA_VERSION = 2
+log = logging.getLogger("smart_attendance.db")
+
+SCHEMA_VERSION = 5
+# MySQL errors worth retrying: lost connection (2006/2013/2055), deadlock (1213), lock wait (1205).
+TRANSIENT_ERRNOS = {1205, 1213, 2003, 2006, 2013, 2055}
+
+
+class _SafeUnpickler(pickle.Unpickler):
+    """Embeddings are stored as pickled numpy arrays (legacy format). Only numpy array
+    reconstruction is allowed so a tampered DB blob cannot execute arbitrary code."""
+    _ALLOWED = {
+        ("numpy", "ndarray"), ("numpy", "dtype"),
+        ("numpy.core.multiarray", "_reconstruct"), ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"), ("numpy._core.multiarray", "scalar"),
+        ("numpy.core.numeric", "_frombuffer"), ("numpy._core.numeric", "_frombuffer"),
+        ("builtins", "list"), ("builtins", "tuple"),
+    }
+
+    def find_class(self, module, name):
+        if (module, name) in self._ALLOWED:
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(f"blocked unpickle of {module}.{name}")
+
+
+def _safe_loads(blob):
+    return _SafeUnpickler(io.BytesIO(blob)).load()
 
 
 class _MySQLRow(tuple):
@@ -105,50 +134,126 @@ class _MySQLConnection:
         self.close()
 
 
-def _mysql_connection_from_env():
+_pools: Dict[tuple, Any] = {}
+_pools_lock = threading.Lock()
+
+
+def reset_pools() -> None:
+    """Drop all connection pools (tests / config change)."""
+    with _pools_lock:
+        for pool in _pools.values():
+            try:
+                pool._remove_connections()
+            except Exception:
+                log.debug("pool cleanup failed", exc_info=True)
+        _pools.clear()
+
+
+def _conn_config() -> Dict[str, Any]:
+    return dict(
+        host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+        port=int(os.getenv("MYSQL_PORT", "3306")),
+        user=os.getenv("MYSQL_USER", "root"),
+        password=os.getenv("MYSQL_PASSWORD", ""),
+        database=os.getenv("MYSQL_DATABASE", "smart_attendance"),
+    )
+
+
+def _ensure_database(cfg: Dict[str, Any]) -> None:
+    import mysql.connector
+    boot = mysql.connector.connect(host=cfg["host"], port=cfg["port"], user=cfg["user"],
+                                   password=cfg["password"], autocommit=True, connection_timeout=10)
+    try:
+        name = cfg["database"].replace("`", "")
+        cur = boot.cursor()
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS `{name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        cur.close()
+    finally:
+        boot.close()
+
+
+def _get_pool(cfg: Dict[str, Any]):
+    import mysql.connector.pooling as pooling
+    key = tuple(sorted(cfg.items()))
+    with _pools_lock:
+        pool = _pools.get(key)
+        if pool is None:
+            size = max(1, min(32, int(os.getenv("MYSQL_POOL_SIZE", "20"))))
+            pool = pooling.MySQLConnectionPool(
+                pool_name="sa_" + hashlib.sha1(repr(key).encode()).hexdigest()[:10],
+                pool_size=size, pool_reset_session=True, autocommit=False,
+                charset="utf8mb4", connection_timeout=10, time_zone="+00:00", **cfg)
+            _pools[key] = pool
+        return pool
+
+
+def _mysql_connection_from_env(retries: int = 3):
+    """Pooled MySQL connection (session time zone is UTC). Waits (up to MYSQL_POOL_WAIT_SEC) for a free
+    pooled connection under load, and retries transient connection failures."""
     try:
         import mysql.connector
+        from mysql.connector.errors import PoolError
     except ImportError as exc:
         raise RuntimeError('MySQL runtime requires mysql-connector-python. Install requirements.txt first.') from exc
-    host=os.getenv('MYSQL_HOST','127.0.0.1')
-    port=int(os.getenv('MYSQL_PORT','3306'))
-    user=os.getenv('MYSQL_USER','root')
-    password=os.getenv('MYSQL_PASSWORD','')
-    database=os.getenv('MYSQL_DATABASE','smart_attendance')
-    try:
-        raw=mysql.connector.connect(host=host,port=port,user=user,password=password,database=database,autocommit=False)
-    except mysql.connector.Error as exc:
-        # If the database itself has not been created, create it once using a server-level connection.
-        if getattr(exc, 'errno', None) in (1049,):
-            bootstrap=mysql.connector.connect(host=host,port=port,user=user,password=password,autocommit=True)
-            cur=bootstrap.cursor()
-            cur.execute(f"CREATE DATABASE IF NOT EXISTS `{database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-            cur.close(); bootstrap.close()
-            raw=mysql.connector.connect(host=host,port=port,user=user,password=password,database=database,autocommit=False)
-        else:
-            raise
-    return _MySQLConnection(raw)
+    cfg = _conn_config()
+    key = tuple(sorted(cfg.items()))
+    wait_until = time.monotonic() + float(os.getenv("MYSQL_POOL_WAIT_SEC", "10"))
+    delay, attempt = 0.5, 0
+    while True:
+        try:
+            try:
+                return _MySQLConnection(_get_pool(cfg).get_connection())
+            except PoolError:
+                if time.monotonic() >= wait_until:
+                    raise
+                time.sleep(0.02)                       # all pooled connections busy: wait for one to be released
+                continue
+            except mysql.connector.Error as exc:
+                if getattr(exc, "errno", None) == 1049:   # unknown database: create it once
+                    _ensure_database(cfg)
+                    with _pools_lock:
+                        _pools.pop(key, None)
+                    return _MySQLConnection(_get_pool(cfg).get_connection())
+                raise
+        except mysql.connector.Error as exc:
+            attempt += 1
+            if attempt >= retries or getattr(exc, "errno", None) not in TRANSIENT_ERRNOS:
+                raise
+            log.warning("MySQL connect failed (attempt %d/%d): %s", attempt, retries, exc)
+            time.sleep(delay)
+            delay *= 2
 
 
-def _ensure_mysql_schema():
-    con=_mysql_connection_from_env()
-    schema_path=Path(__file__).resolve().parents[2] / 'database' / 'schema_mysql.sql'
-    script=schema_path.read_text(encoding='utf-8')
-    # The schema file has a CREATE DATABASE/USE preamble; the connection is already on the target DB.
-    statements=[]
-    current=[]
+def _split_sql(script: str) -> List[str]:
+    statements, current = [], []
     for line in script.splitlines():
         if line.strip().startswith('--'):
             continue
         current.append(line)
         if line.rstrip().endswith(';'):
-            st='\n'.join(current).strip(); current=[]
-            if st.upper().startswith('CREATE DATABASE') or st.upper().startswith('USE '):
+            st = '\n'.join(current).strip()
+            current = []
+            if st.upper().startswith(('CREATE DATABASE', 'USE ')):
                 continue
-            if st: statements.append(st)
-    for st in statements:
-        con.execute(st)
-    con.commit(); con.close()
+            if st:
+                statements.append(st)
+    return statements
+
+
+def _ensure_mysql_schema():
+    """Create missing tables (idempotent) then apply versioned migrations."""
+    schema_path = Path(__file__).resolve().parents[2] / 'database' / 'schema_mysql.sql'
+    con = _mysql_connection_from_env()
+    try:
+        for st in _split_sql(schema_path.read_text(encoding='utf-8')):
+            con.execute(st)
+        con.commit()
+    finally:
+        con.close()
+    from backend.database.migrations import run_migrations
+    run_migrations(_mysql_connection_from_env)
+
+INSECURE_PASSWORDS = {"", "change_me", "changeme", "password", "admin", "admin123", "123456"}
 
 DAY_MAP = {
     "mo": "monday", "mon": "monday", "monday": "monday",
@@ -230,26 +335,22 @@ class DatabaseManager:
     def verify_credential(self, id_number: str, password: str, role: str) -> Dict[str, Any]:
         with self._conn() as con:
             role = role.strip().lower()
+            # Bootstrap admin authentication from environment without storing the admin password in the database.
             if role == "admin":
                 env_id = os.environ.get("ADMIN_ID", "ADMIN").strip()
                 env_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
-                cloud_mode = os.environ.get("CLOUD_MODE", "0") == "1"
-                if cloud_mode and env_pw in ("", "change_me", "the_fool_12"):
-                    # Publicly hosted: never fall back to the built-in default password.
-                    return {"valid": False, "error": "Administrator password is not configured on the server."}
-                if env_pw in ("", "change_me"):
-                    env_pw = "the_fool_12"
-                input_id = id_number.strip().lower()
-                target_id = env_id.lower()
-                if (input_id == target_id or input_id in {"admin", "administrator"}):
-                    if hmac.compare_digest(password.strip(), env_pw) or (not cloud_mode and password.strip() == "the_fool_12"):
+                if env_pw in INSECURE_PASSWORDS:
+                    log.error("ADMIN_PASSWORD is unset or a placeholder; administrator login is disabled")
+                    return {"valid": False, "error": "Administrator password is not configured. Set ADMIN_PASSWORD in .env."}
+                if env_pw and hmac.compare_digest(id_number.strip(), env_id):
+                    if hmac.compare_digest(password.strip(), env_pw):
                         return {"valid": True, "name": os.environ.get("ADMIN_NAME", "Administrator")}
                     return {"valid": False, "error": "Incorrect administrator password."}
             row = con.execute("SELECT * FROM authorized_credentials WHERE id_number=? AND role=?", (id_number.strip(), role)).fetchone()
             if not row:
                 total = con.execute("SELECT COUNT(*) FROM authorized_credentials WHERE role=?", (role,)).fetchone()[0]
                 # Preserve the existing enrollment experience until credentials are configured for that role.
-                if total == 0 and role in {"student", "teacher"} and os.environ.get("ALLOW_OPEN_REGISTRATION", "1") == "1":
+                if total == 0 and role in {"student", "teacher"} and os.environ.get("ALLOW_OPEN_REGISTRATION", "0") == "1":
                     return {"valid": True, "name": "", "open_registration": True}
                 return {"valid": False, "error": f"Invalid {role.capitalize()} ID number. Please check with administrator."}
             valid, needs_upgrade = _verify_password(password.strip(), row["password"])
@@ -258,6 +359,35 @@ class DatabaseManager:
             if needs_upgrade:
                 con.execute("UPDATE authorized_credentials SET password=? WHERE id_number=?", (_hash_password(password.strip()), id_number.strip()))
             return {"valid": True, "name": row["allocated_name"] or ""}
+
+    ROLES = ("superadmin", "admin", "hod", "teacher", "student")
+
+    def authenticate(self, id_number: str, password: str) -> Dict[str, Any]:
+        """Single sign-in for every role. The role comes from the account, never from the caller.
+        The environment administrator (ADMIN_ID / ADMIN_PASSWORD) is the super admin. The error text is
+        identical for unknown ID and wrong password (no account enumeration)."""
+        idn, pw = str(id_number or "").strip(), str(password or "").strip()
+        generic = {"valid": False, "error": "Invalid ID or password."}
+        env_id, env_pw = os.environ.get("ADMIN_ID", "ADMIN").strip(), os.environ.get("ADMIN_PASSWORD", "").strip()
+        if hmac.compare_digest(idn, env_id):
+            if env_pw in INSECURE_PASSWORDS:
+                log.error("ADMIN_PASSWORD is unset or a placeholder; super-admin login is disabled")
+                return {"valid": False, "error": "The administrator password is not configured on the server (ADMIN_PASSWORD in .env)."}
+            if hmac.compare_digest(pw, env_pw):
+                return {"valid": True, "role": "superadmin", "id": env_id, "name": os.environ.get("ADMIN_NAME", "Administrator")}
+            return generic
+        with self._conn() as con:
+            row = con.execute("SELECT id_number, password, role, allocated_name FROM authorized_credentials WHERE id_number=?", (idn,)).fetchone()
+            if not row or row["role"] not in self.ROLES:
+                _verify_password(pw, "scrypt$16384$8$1$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==")  # constant-ish work
+                return generic
+            valid, needs_upgrade = _verify_password(pw, row["password"])
+            if not valid:
+                return generic
+            if needs_upgrade:
+                con.execute("UPDATE authorized_credentials SET password=? WHERE id_number=?", (_hash_password(pw), idn))
+            u = con.execute("SELECT name FROM users WHERE roll_no=?", (idn,)).fetchone()
+            return {"valid": True, "role": row["role"], "id": row["id_number"], "name": (u["name"] if u else None) or row["allocated_name"] or idn}
 
     def get_authorized_credentials(self, role: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._conn() as con:
@@ -280,18 +410,19 @@ class DatabaseManager:
         multi_blob = pickle.dumps([np.asarray(e, dtype=np.float32) for e in multi_embeddings])
         with self._conn() as con:
             con.execute("""INSERT OR REPLACE INTO users
-                (roll_no, name, role, embedding, multi_embeddings, mesh_path)
-                VALUES (?,?,?,?,?,?)""", (roll_no.strip(), name.strip(), role.strip().lower(), blob, multi_blob, mesh_path))
+                (roll_no, name, role, embedding, multi_embeddings, mesh_path, embedding_model)
+                VALUES (?,?,?,?,?,?,?)""", (roll_no.strip(), name.strip(), role.strip().lower(), blob, multi_blob, mesh_path,
+                                              os.getenv("FACE_MODEL_NAME", "buffalo_sc")))
 
     @staticmethod
     def _decode_embeddings(row) -> tuple[np.ndarray, List[np.ndarray]]:
-        emb = pickle.loads(row["embedding"])
-        multi = pickle.loads(row["multi_embeddings"]) if row["multi_embeddings"] else [emb]
+        emb = _safe_loads(row["embedding"])
+        multi = _safe_loads(row["multi_embeddings"]) if row["multi_embeddings"] else [emb]
         return emb, multi
 
     def get_all_users(self) -> List[Dict[str, Any]]:
         with self._conn() as con:
-            rows = con.execute("SELECT * FROM users ORDER BY roll_no").fetchall()
+            rows = con.execute("SELECT * FROM users WHERE embedding IS NOT NULL ORDER BY roll_no").fetchall()
         result = []
         for r in rows:
             emb, multi = self._decode_embeddings(r)
@@ -302,8 +433,8 @@ class DatabaseManager:
     def get_dashboard_counts(self) -> Dict[str, int]:
         """Lightning-fast counts for dashboard cards without unpickling embeddings."""
         with self._conn() as con:
-            students = con.execute("SELECT COUNT(*) FROM users WHERE role='student'").fetchone()[0]
-            teachers = con.execute("SELECT COUNT(*) FROM users WHERE role='teacher'").fetchone()[0]
+            students = con.execute("SELECT COUNT(*) FROM users WHERE role='student' AND embedding IS NOT NULL").fetchone()[0]
+            teachers = con.execute("SELECT COUNT(*) FROM users WHERE role='teacher' AND embedding IS NOT NULL").fetchone()[0]
             rooms = con.execute("SELECT COUNT(*) FROM rooms").fetchone()[0]
             timetable = con.execute("SELECT COUNT(*) FROM timetable").fetchone()[0]
             return {
@@ -329,7 +460,7 @@ class DatabaseManager:
                 cur = con.execute("DELETE FROM users WHERE roll_no=?", (roll_no_str,))
                 return cur.rowcount > 0
         except Exception as e:
-            print(f"Error deleting user: {e}")
+            log.exception("delete_user failed for %s", roll_no_str)
             return False
 
     def update_user_details(self, old_roll_no: str, new_roll_no: str, new_name: str, new_role: str) -> bool:
@@ -352,13 +483,13 @@ class DatabaseManager:
                 con.close()
             return res
         except Exception as e:
-            print(f"Error updating user details: {e}")
+            log.exception("update_user_details failed for %s", old_r)
             return False
 
     def get_user_by_roll(self, roll_no: str) -> Optional[Dict[str, Any]]:
         with self._conn() as con:
             r = con.execute("SELECT * FROM users WHERE roll_no=?", (roll_no.strip(),)).fetchone()
-            if not r:
+            if not r or r["embedding"] is None:          # no face registered (never, or reset by an admin)
                 return None
             emb, multi = self._decode_embeddings(r)
             return {"roll_no": r["roll_no"], "name": r["name"], "role": r["role"], "embedding": emb, "multi_embeddings": multi, "registered_at": r["registered_at"]}
@@ -380,6 +511,26 @@ class DatabaseManager:
             con.execute("INSERT INTO room_camera_config (room_id,teacher_zone_x1,teacher_zone_y1,teacher_zone_x2,teacher_zone_y2) VALUES (?,?,?,?,?) "
                         "ON DUPLICATE KEY UPDATE teacher_zone_x1=VALUES(teacher_zone_x1),teacher_zone_y1=VALUES(teacher_zone_y1),teacher_zone_x2=VALUES(teacher_zone_x2),teacher_zone_y2=VALUES(teacher_zone_y2)",
                         (rid, x1, y1, x2, y2))
+            self._sync_room_camera(con, rid, str(camera_url).strip())
+
+    @staticmethod
+    def _sync_room_camera(con, room_id: str, source: str) -> None:
+        """The desktop room editor only knows one camera string per room. Mirror it into the
+        cameras table (the single source the scheduler reads) without touching other cameras."""
+        from backend.core.camera_types import infer_camera_type
+        name = f"{room_id} camera"
+        row = con.execute("SELECT camera_id FROM cameras WHERE room_id=%s AND name=%s", (room_id, name)).fetchone()
+        if not source:
+            if row:
+                con.execute("UPDATE cameras SET enabled=0, camera_type='none' WHERE camera_id=%s", (row[0],))
+            return
+        ctype = infer_camera_type(source)
+        if row:
+            con.execute("UPDATE cameras SET camera_type=%s, source=%s, enabled=1 WHERE camera_id=%s", (ctype, source, row[0]))
+        elif not con.execute("SELECT 1 FROM cameras WHERE room_id=%s AND enabled=1 LIMIT 1", (room_id,)).fetchone():
+            con.execute("INSERT INTO cameras (name,camera_type,source,room_id,enabled) VALUES (%s,%s,%s,%s,1) "
+                        "ON DUPLICATE KEY UPDATE room_id=VALUES(room_id), source=VALUES(source), camera_type=VALUES(camera_type), enabled=1",
+                        (name, ctype, source, room_id))
 
     def get_rooms(self) -> List[Dict[str, str]]:
         with self._conn() as con:
@@ -433,26 +584,46 @@ class DatabaseManager:
             return [dict(r) for r in rows]
 
     # --- Attendance / sessions ---
-    def create_session(self, session_id: str, timetable_id: int, date: str, subject: str = "General Class") -> None:
-        with self._conn() as con:
-            con.execute("INSERT OR REPLACE INTO sessions (session_id,timetable_id,date,status,subject) VALUES (?,?,?,?,?)",
-                        (session_id, timetable_id, date, "active", subject))
+    def create_session(self, session_id: str, timetable_id: int, date: str, subject: str = "General Class",
+                       **extra) -> bool:
+        """Idempotent: creates the row if missing and never resets an existing session.
+        Returns True only when this call created it. ``extra`` may carry room_id, teacher_id,
+        section_id, counted_start, counted_end, scheduled_start,
+        scheduled_end, state."""
+        cols = {"session_id": session_id, "timetable_id": timetable_id, "date": date,
+                "status": "active", "subject": subject}
+        allowed = {"room_id", "teacher_id", "section_id", "counted_start", "counted_end",
+                   "scheduled_start", "scheduled_end", "state"}
+        cols.update({k: v for k, v in extra.items() if k in allowed})
+        names = ",".join(f"`{c}`" for c in cols)
+        marks = ",".join("%s" for _ in cols)
+        import mysql.connector
+        try:
+            with self._conn() as con:
+                con.execute(f"INSERT INTO sessions ({names}) VALUES ({marks})", tuple(cols.values()))
+            return True
+        except mysql.connector.IntegrityError as exc:
+            if getattr(exc, "errno", None) == 1062:   # duplicate session_id / (timetable_id, date)
+                return False
+            raise
 
     def update_session_status(self, session_id: str, status: str) -> None:
         with self._conn() as con:
             con.execute("UPDATE sessions SET status=? WHERE session_id=?", (status, session_id))
 
     def log_attendance(self, session_id: str, roll_no: str, role: str, status: str, confidence: float) -> None:
+        """Atomic upsert on (session_id, roll_no). A manual override is never overwritten."""
+        now = datetime.now().isoformat(timespec="seconds")
         with self._conn() as con:
-            existing = con.execute("SELECT log_id,is_override,original_auto_status FROM attendance_log WHERE session_id=? AND roll_no=?", (session_id, roll_no)).fetchone()
-            now = datetime.now().isoformat(timespec="seconds")
-            if not existing:
-                con.execute("""INSERT INTO attendance_log
-                    (session_id,roll_no,role,timestamp,status,confidence,original_auto_status)
-                    VALUES (?,?,?,?,?,?,?)""", (session_id, roll_no, role, now, status, confidence, status))
-            elif existing["is_override"] != 1:
-                con.execute("UPDATE attendance_log SET status=?,timestamp=?,confidence=?,original_auto_status=? WHERE session_id=? AND roll_no=?",
-                            (status, now, confidence, status, session_id, roll_no))
+            con.execute("""INSERT INTO attendance_log
+                (session_id,roll_no,role,timestamp,status,confidence,original_auto_status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON DUPLICATE KEY UPDATE
+                  status=IF(is_override=1,status,VALUES(status)),
+                  timestamp=IF(is_override=1,timestamp,VALUES(timestamp)),
+                  confidence=IF(is_override=1,confidence,VALUES(confidence)),
+                  original_auto_status=IF(is_override=1,original_auto_status,VALUES(original_auto_status))""",
+                        (session_id, roll_no, role, now, status, confidence, status))
 
     def get_warning_count(self, roll_no: str) -> int:
         with self._conn() as con:
@@ -560,7 +731,10 @@ class DatabaseManager:
                        COALESCE(a.is_override,0) is_override,COALESCE(a.override_reason,'') override_reason,
                        a.timestamp last_scanned,a.confidence
                        FROM users u LEFT JOIN attendance_log a ON u.roll_no=a.roll_no AND a.session_id=?
-                       WHERE u.role='student' ORDER BY u.roll_no""", (session_id.strip(),)).fetchall()
+                       WHERE u.role='student' AND (
+                           (SELECT section_id FROM sessions WHERE session_id=?) IS NULL
+                           OR u.roll_no IN (SELECT roll_no FROM student_sections WHERE section_id=(SELECT section_id FROM sessions WHERE session_id=?)))
+                       ORDER BY u.roll_no""", (session_id.strip(), session_id.strip(), session_id.strip())).fetchall()
             return [dict(r) for r in rows]
 
     def apply_manual_override(self, session_id: str, roll_no: str, new_status: str, teacher_id: str, reason: str,
@@ -624,7 +798,7 @@ class DatabaseManager:
                   student_name StudentName,original_status OriginalAutoStatus,new_status OverriddenStatus,teacher_id OverriddenByTeacherID,
                   teacher_name TeacherName,reason OverrideReason,overridden_at TimestampOfChange FROM attendance_overrides ORDER BY overridden_at DESC"""
         with self._conn() as con:
-            return pd.read_sql_query(query, con)
+            return pd.read_sql_query(query, con.raw)
 
     def upsert_teacher_attendance(self, session_id: str, teacher_id: str, date: str,
                                   counted_start: Optional[str], counted_end: Optional[str],
@@ -674,4 +848,4 @@ class DatabaseManager:
                   FROM attendance_log a LEFT JOIN sessions s ON a.session_id=s.session_id LEFT JOIN timetable t ON s.timetable_id=t.id
                   LEFT JOIN rooms r ON t.room_id=r.room_id LEFT JOIN users u ON a.roll_no=u.roll_no ORDER BY a.timestamp DESC"""
         with self._conn() as con:
-            return pd.read_sql_query(query, con)
+            return pd.read_sql_query(query, con.raw)

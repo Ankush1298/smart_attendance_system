@@ -304,34 +304,6 @@ def _ocr_quality(boxes: Sequence[TextBox]) -> int:
     return score + day_hits * 20 + time_hits * 25
 
 
-    best: List[int] = []
-    best_cv = float("inf")
-    n = len(vals)
-    # aSc's class-wise layout has one weekday column followed by equally
-    # spaced period columns. Prefer the longest run, then the run with the
-    # smallest spacing variation. This deliberately rejects the outer page
-    # border (91) in favour of the real table edge (142) in the supplied PDF.
-    for i in range(n):
-        seq = [vals[i]]
-        gaps: List[float] = []
-        for j in range(i + 1, n):
-            gap = vals[j] - vals[j - 1]
-            if gaps:
-                med = float(np.median(gaps))
-                if gap < 0.65 * med or gap > 1.55 * med:
-                    break
-            gaps.append(gap)
-            seq.append(vals[j])
-        if len(gaps) >= 3:
-            med = float(np.mean(gaps))
-            cv = float(np.std(gaps) / med) if med else float("inf")
-        else:
-            cv = float("inf")
-        if len(seq) > len(best) or (len(seq) == len(best) and cv < best_cv):
-            best, best_cv = seq, cv
-    return best if len(best) >= 6 else vals
-
-
 def run_tesseract_ocr(img_bgr: np.ndarray, psm: int = 6) -> List[TextBox]:
     """OCR fallback using the locally installed Tesseract engine.
 

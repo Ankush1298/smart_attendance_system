@@ -4,6 +4,7 @@ so it can be unit-tested with pytest).  registration_server.py imports from here
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 import threading
@@ -11,6 +12,8 @@ import time
 from collections import deque
 
 import numpy as np
+
+log = logging.getLogger("smart_attendance.kyc")
 
 # ==============================================================================
 # SETTINGS & CALIBRATION
@@ -35,9 +38,17 @@ TURN_THRESHOLD_YAW = min(TURN_THRESHOLD_LEFT, TURN_THRESHOLD_RIGHT)
 TURN_THRESHOLD_PITCH = min(TURN_THRESHOLD_UP, TURN_THRESHOLD_DOWN)
 # The OTHER axis may move at most this fraction of the target axis (stops diagonal cheating).
 CROSS_AXIS_RATIO = 0.5
-SMOOTH_FRAMES = 5
-MIN_HOLD_FRAMES = 8
-MAX_FRAME_DT = 0.15
+# Windows are measured in SECONDS, not frames. They used to be 5 / 15 / 8 frames, which is the same thing
+# at ~10 fps, but on a slow link (1-2 fps) it meant 8-15 s of forced stillness. The pose/spread
+# limits below are unchanged, so the capture is exactly as strict at any frame rate.
+POSE_WINDOW_S = 0.6              # smoothing/stillness window (was 5 frames)
+POSE_MAX_SAMPLES = 12
+POSE_MIN_SAMPLES = 3
+POSE_MIN_SPAN_S = 0.35           # window must really cover this much time before a step can count
+BASELINE_WINDOW_S = 1.6          # FRONT baseline / coherence window (was 15 frames)
+BASELINE_MIN_SPAN_S = 1.0
+MIN_HOLD_FRAMES = 3              # was 8; HOLD_SECONDS already enforces the hold at normal frame rates
+MAX_FRAME_DT = 0.35              # was 0.15: a slow frame is real elapsed time, not a reason to stall
 # FRONT (baseline) must be a real, still, straight-on face.
 FRONT_YAW_MAX = 0.06
 FRONT_PITCH_RANGE = (0.32, 0.68)
@@ -45,7 +56,6 @@ FRONT_ROLL_MAX = 12
 FRONT_STABLE_STD_YAW = 0.025     # pose must be still over the smoothing window
 FRONT_STABLE_STD_PITCH = 0.030
 FRONT_MAX_SPREAD = 0.05          # baseline frames must agree with each other (max-min) or FRONT is retried
-BASELINE_SAMPLES = 15            # baseline = median of the LAST N stable frames only
 HOLD_SECONDS = 0.8
 DECAY = 1.0
 IDENTITY_MIN_SIM = 0.30
@@ -126,6 +136,8 @@ class KYCSession:
     def __init__(self, db_manager):
         self.db = db_manager
         self.lock = threading.Lock()
+        self.frame_lock = threading.Lock()     # serialises overlapping frame uploads (see register.api_frame)
+        self.last_seq = 0
         self.last_seen = time.time()
         self.last_frame_t = None
         self.guidance = ("no_face", "Position your face inside the circle")
@@ -149,8 +161,8 @@ class KYCSession:
         self.embeddings = {}
         self.base_yaw = 0.0
         self.base_pitch = 0.5
-        self.front_samples = deque(maxlen=BASELINE_SAMPLES)   # good frames -> baseline
-        self.front_track = deque(maxlen=BASELINE_SAMPLES)     # EVERY recent FRONT frame -> coherence check
+        self.front_samples = deque()   # (t, yaw, pitch) good frames of the last BASELINE_WINDOW_S -> baseline
+        self.front_track = deque()     # (t, yaw, pitch) EVERY frame of the last BASELINE_WINDOW_S -> coherence
         self.best_emb = None
         self.best_score = -1.0
         self.best_norm = 0.0
@@ -262,7 +274,7 @@ class KYCSession:
                     self.guidance = ("identity", "Different face detected. Hold still.")
                     if now - self._last_log_t > 0.5:
                         self._last_log_t = now
-                        print(f"[KYC] identity low step={step} sim_ref={sim_ref:.2f} "
+                        log.debug(f"[KYC] identity low step={step} sim_ref={sim_ref:.2f} "
                               f"sim_prev={sim_prev:.2f} pitch={face['pitch']:.2f} yaw={face['yaw']:.2f}")
                     if self.mismatch_time > 3.5:
                         self._fail("Scan aborted: face mismatch detected during verification.")
@@ -274,18 +286,24 @@ class KYCSession:
 
             # Smooth the pose. The window must be FULL before any step can count, so a couple of
             # jittery frames right after a step change can never complete anything.
-            self.pose_win.append((face["yaw"], face["pitch"], face["roll"]))
-            self.pose_win = self.pose_win[-SMOOTH_FRAMES:]
-            if len(self.pose_win) < SMOOTH_FRAMES:
+            now = time.time()
+            self.pose_win.append((now, face["yaw"], face["pitch"], face["roll"]))
+            recent = [w for w in self.pose_win if now - w[0] <= POSE_WINDOW_S]
+            if len(recent) < POSE_MIN_SAMPLES:       # very slow link: always keep the last few samples
+                recent = self.pose_win[-POSE_MIN_SAMPLES:]
+            self.pose_win = recent[-POSE_MAX_SAMPLES:]
+            if len(self.pose_win) < POSE_MIN_SAMPLES or now - self.pose_win[0][0] < POSE_MIN_SPAN_S:
                 return
-            ys = [w[0] for w in self.pose_win]
-            ps = [w[1] for w in self.pose_win]
+            ys = [w[1] for w in self.pose_win]
+            ps = [w[2] for w in self.pose_win]
             yaw = float(np.median(ys))
             pitch = float(np.median(ps))
-            roll = float(np.median([w[2] for w in self.pose_win]))
+            roll = float(np.median([w[3] for w in self.pose_win]))
 
             if step == "FRONT":
-                self.front_track.append((yaw, pitch))
+                self.front_track.append((now, yaw, pitch))
+                while self.front_track and now - self.front_track[0][0] > BASELINE_WINDOW_S:
+                    self.front_track.popleft()
                 visible = face["det_score"] >= FRONT_MIN_DET
                 still = (float(np.std(ys)) < FRONT_STABLE_STD_YAW
                          and float(np.std(ps)) < FRONT_STABLE_STD_PITCH)
@@ -306,7 +324,7 @@ class KYCSession:
                 good = (pose == step)
                 if KYC_DEBUG and time.time() - self._last_log_t > 0.5:
                     self._last_log_t = time.time()
-                    print(f"[KYC] step={step} dx={dx:+.2f} dy={dy:+.2f} "
+                    log.debug(f"[KYC] step={step} dx={dx:+.2f} dy={dy:+.2f} "
                           f"need L/R>={TURN_THRESHOLD_LEFT:.2f}/{TURN_THRESHOLD_RIGHT:.2f} "
                           f"U/D>={TURN_THRESHOLD_UP:.2f}/{TURN_THRESHOLD_DOWN:.2f} pose={pose}")
                 if not good:
@@ -328,7 +346,9 @@ class KYCSession:
                 self.step_samples.sort(key=lambda x: x[0], reverse=True)
                 self.step_samples = self.step_samples[:5]
                 if step == "FRONT":
-                    self.front_samples.append((yaw, pitch))
+                    self.front_samples.append((now, yaw, pitch))
+                    while self.front_samples and now - self.front_samples[0][0] > BASELINE_WINDOW_S:
+                        self.front_samples.popleft()
             else:
                 self._decay(step, dt)
 
@@ -352,9 +372,10 @@ class KYCSession:
 
     def _baseline_is_coherent(self):
         """None = not enough history yet, True = steady baseline, False = head was moving."""
-        if len(self.front_samples) < MIN_HOLD_FRAMES or len(self.front_track) < BASELINE_SAMPLES:
+        if (len(self.front_samples) < MIN_HOLD_FRAMES or len(self.front_track) < POSE_MIN_SAMPLES
+                or self.front_track[-1][0] - self.front_track[0][0] < BASELINE_MIN_SPAN_S):
             return None
-        ys, ps = zip(*self.front_track)
+        _, ys, ps = zip(*self.front_track)
         return (max(ys) - min(ys)) <= FRONT_MAX_SPREAD and (max(ps) - min(ps)) <= FRONT_MAX_SPREAD
 
     def _complete_step(self, step):
@@ -366,7 +387,7 @@ class KYCSession:
         self.done.append(step)
 
         if step == "FRONT":
-            ys, ps = zip(*self.front_samples)
+            _, ys, ps = zip(*self.front_samples)
             self.base_yaw = float(np.median(ys))
             self.base_pitch = float(np.median(ps))
 
@@ -374,7 +395,7 @@ class KYCSession:
         match = best_match([self.best_emb], all_registered)
         if step == "FRONT":
             closest = f"{match[0]} sim={match[2]:.2f}" if match else "none"
-            print(f"[KYC] {self.roll} ({self.role}) front capture. Closest registered: {closest}")
+            log.info(f"[KYC] {self.roll} ({self.role}) front capture. Closest registered: {closest}")
         if match and match[2] >= DUPLICATE_THRESHOLD:
             self._fail_duplicate(match)
             return

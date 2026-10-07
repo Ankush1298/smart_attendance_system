@@ -1,52 +1,38 @@
-# Deploying to the cloud
+# Deploying to the cloud (Railway)
 
-One container serves both the frontend (student/faculty KYC portals and the admin
-panel, rendered by `register.py`) and the backend (face recognition, MySQL access).
-It needs a MySQL 8 database. Instructions below use Railway; any Docker host works
-(Render, Fly.io, Cloud Run) as long as you provide the same environment variables
-and a MySQL database.
+Two services from this one repo/Dockerfile, plus a MySQL 8 database:
 
-## Railway
+| Service | `SERVICE` var | What it serves |
+|---|---|---|
+| **app** | *(unset)* | Admin / teacher / student web UI, REST API, attendance scheduler (`server.py`) |
+| **register** | `register` | Face-registration portal for phones (`/student`, `/teacher`) |
 
-1. Railway dashboard -> **New Project** -> **Deploy from GitHub repo** -> pick this repo.
-   `railway.json` and the `Dockerfile` are picked up automatically.
-2. In the same project: **New** -> **Database** -> **MySQL**.
-3. On the app service, set these variables (references to the MySQL service):
+Both get HTTPS from the platform, which phone browsers require for camera access.
+
+## Steps
+
+1. Railway -> **New Project** -> **Deploy from GitHub repo** -> this repo (`railway.json` + `Dockerfile` are picked up). This is the **app** service.
+2. **New -> Database -> MySQL** in the same project.
+3. On **app**, set variables:
 
    | Variable | Value |
    |---|---|
-   | `MYSQL_HOST` | `${{MySQL.MYSQLHOST}}` |
-   | `MYSQL_PORT` | `${{MySQL.MYSQLPORT}}` |
-   | `MYSQL_USER` | `${{MySQL.MYSQLUSER}}` |
-   | `MYSQL_PASSWORD` | `${{MySQL.MYSQLPASSWORD}}` |
-   | `MYSQL_DATABASE` | `${{MySQL.MYSQLDATABASE}}` |
-   | `ADMIN_ID` | `ADMIN` (or your choice) |
-   | `ADMIN_PASSWORD` | a long random secret (**required**) |
+   | `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | `${{MySQL.MYSQLHOST}}` / `${{MySQL.MYSQLPORT}}` / `${{MySQL.MYSQLUSER}}` / `${{MySQL.MYSQLPASSWORD}}` / `${{MySQL.MYSQLDATABASE}}` |
+   | `ADMIN_ID`, `ADMIN_PASSWORD` | your admin login (**required**, long and random) |
+   | `APP_SECRET_KEY` | `python -c "import secrets;print(secrets.token_hex(32))"` (otherwise everyone is signed out on each restart) |
+   | `APP_TIMEZONE` | e.g. `Asia/Kolkata` (timetable times are wall-clock in this zone) |
+   | `REGISTRATION_PUBLIC_URL` | the **register** service's public URL, e.g. `https://xyz.up.railway.app` |
 
-4. Service **Settings -> Networking -> Generate Domain**. The platform provides HTTPS,
-   which phone browsers require for camera access.
-5. Open `https://<your-domain>/` (hub), `/student`, `/teacher`, `/admin`.
+   Generate a domain under **Settings -> Networking**.
+4. **New -> GitHub Repo** (same repo) for the second service -> name it **register**. Give it the same `MYSQL_*`, `ADMIN_ID`, `ADMIN_PASSWORD` variables, plus `SERVICE=register`. Generate a domain and put it in the app's `REGISTRATION_PUBLIC_URL`.
+5. Open the app URL and sign in with `ADMIN_ID` / `ADMIN_PASSWORD`. Create student/teacher logins under Accounts; QR codes there point people to the register service. The schema is created automatically on first start.
 
-The schema is created automatically on first start.
+## Notes
 
-## Behaviour in the cloud (`CLOUD_MODE=1`, set in the Dockerfile)
-
-- The built-in default admin password is disabled. If `ADMIN_PASSWORD` is unset or a
-  placeholder, admin login is refused.
-- `ALLOW_OPEN_REGISTRATION=0`: only IDs/passcodes pre-authorised by the admin can
-  enroll. Create them from the desktop app's credentials screen, pointing the desktop
-  app's `MYSQL_*` at the same cloud database (the Railway MySQL public/TCP proxy
-  address), or insert into `authorized_credentials` yourself.
-- Runs a single worker. KYC and admin sessions are kept in memory, so do not scale to
-  more than one replica, and admins must log in again after a redeploy.
-
-## Not hosted
-
-- The desktop app (`main.py`, live classroom cameras) stays on-prem; it talks to the same
-  MySQL database.
-- `backend/api/app.py` (REST API) has no authentication, so it is deliberately not exposed.
-- `frontend/admin/` and `static/` call endpoints (`/api/stats`, `/api/timetable/upload`)
-  that no server currently implements, so they are not served.
+- Keep **one replica** per service: sessions, login throttling and the scheduler are in memory.
+- `CLOUD_MODE=1`, `ALLOW_OPEN_REGISTRATION=0` and `DISABLE_REGISTRATION=1` (the in-process portal on port 5050, replaced by the register service) are set in the Dockerfile.
+- Classroom cameras (USB / LAN RTSP) are not reachable from the cloud. Cameras and live attendance only work in the cloud for sources the server can reach over the internet; otherwise run the scheduler on-site against the same cloud database.
+- The face model is baked into the image (`buffalo_sc`, ~15 MB); allow roughly 1 GB RAM per service.
 
 ## Local container test
 
@@ -54,4 +40,5 @@ The schema is created automatically on first start.
 docker build -t smart-attendance .
 docker run --rm -p 8000:8000 -e PORT=8000 -e ADMIN_PASSWORD=choose-one \
   -e MYSQL_HOST=host.docker.internal -e MYSQL_USER=root -e MYSQL_PASSWORD=... smart-attendance
+# registration portal: add  -e SERVICE=register
 ```

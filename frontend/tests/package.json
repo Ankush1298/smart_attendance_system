@@ -1,0 +1,7 @@
+{
+  "name": "smart-attendance-frontend-tests",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" },
+  "devDependencies": { "axe-core": "^4.10.0", "jsdom": "^26.0.0" }
+}

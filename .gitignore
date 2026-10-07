@@ -20,3 +20,14 @@ Thumbs.db
 # Logs / runtime output
 *.log
 *.tmp
+
+# Added by the upgrade
+logs/
+node_modules/
+graphify-out/
+project_backup.zip
+.pytest_cache/
+.ruff_cache/
+
+# Local source archive
+attendance_source.zip
