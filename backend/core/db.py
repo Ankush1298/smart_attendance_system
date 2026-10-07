@@ -232,13 +232,17 @@ class DatabaseManager:
             role = role.strip().lower()
             if role == "admin":
                 env_id = os.environ.get("ADMIN_ID", "ADMIN").strip()
-                env_pw = os.environ.get("ADMIN_PASSWORD", "").strip() or "the_fool_12"
-                if env_pw == "change_me":
+                env_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
+                cloud_mode = os.environ.get("CLOUD_MODE", "0") == "1"
+                if cloud_mode and env_pw in ("", "change_me", "the_fool_12"):
+                    # Publicly hosted: never fall back to the built-in default password.
+                    return {"valid": False, "error": "Administrator password is not configured on the server."}
+                if env_pw in ("", "change_me"):
                     env_pw = "the_fool_12"
                 input_id = id_number.strip().lower()
                 target_id = env_id.lower()
                 if (input_id == target_id or input_id in {"admin", "administrator"}):
-                    if hmac.compare_digest(password.strip(), env_pw) or password.strip() == "the_fool_12":
+                    if hmac.compare_digest(password.strip(), env_pw) or (not cloud_mode and password.strip() == "the_fool_12"):
                         return {"valid": True, "name": os.environ.get("ADMIN_NAME", "Administrator")}
                     return {"valid": False, "error": "Incorrect administrator password."}
             row = con.execute("SELECT * FROM authorized_credentials WHERE id_number=? AND role=?", (id_number.strip(), role)).fetchone()

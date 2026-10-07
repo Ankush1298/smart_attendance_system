@@ -1,0 +1,13 @@
+# Runtime dependencies for the hosted registration/admin server (register.py).
+# The desktop app (CustomTkinter, camera, OCR) is not needed in the cloud.
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+mysql-connector-python>=9.0
+numpy
+pandas
+pillow
+opencv-python-headless
+onnxruntime
+insightface>=0.7.3

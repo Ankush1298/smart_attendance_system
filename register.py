@@ -728,6 +728,12 @@ HUB_HTML = r"""<!DOCTYPE html>
 # ==============================================================================
 # FASTAPI ROUTES
 # ==============================================================================
+@app.get("/healthz")
+def healthz():
+    """Liveness probe for the hosting platform; deliberately does not touch the database."""
+    return {"status": "ok"}
+
+
 @app.get("/", response_class=HTMLResponse)
 def hub_page():
     return HTMLResponse(content=HUB_HTML)
@@ -952,7 +958,6 @@ ADMIN_LOGIN_HTML = r"""<!DOCTYPE html>
         <input type="password" id="password" class="form-control" placeholder="Enter Admin Password" required autocomplete="current-password">
         <button class="btn btn-outline-secondary" type="button" onclick="togglePass()">👁</button>
       </div>
-      <div class="form-text text-secondary" style="font-size: 0.75rem;">Default admin password: <code>the_fool_12</code></div>
     </div>
 
     <button type="submit" id="btnSubmit" class="btn btn-login w-100 mt-2">Unlock Admin Panel 🚀</button>
@@ -1149,7 +1154,7 @@ def admin_page(
 
 
 @app.post("/admin/login")
-def admin_login(username: str = Form(...), password: str = Form(...)):
+def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
     result = manager.db.verify_credential(username, password, "admin")
     if result.get("valid"):
         token = create_admin_session()
@@ -1160,6 +1165,7 @@ def admin_login(username: str = Form(...), password: str = Form(...)):
             max_age=ADMIN_SESSION_SECONDS,
             httponly=True,
             samesite="lax",
+            secure=request.url.scheme == "https",
         )
         return resp
     return JSONResponse(
@@ -1293,4 +1299,10 @@ def run_registration_server_in_thread(db_instance=None, port: int = 5050, ssl: b
 
 
 if __name__ == "__main__":
-    run_registration_server(host="0.0.0.0", port=5050, ssl=True)
+    if os.environ.get("CLOUD_MODE", "0") == "1":
+        # Hosting platform terminates TLS and injects PORT; one worker only because
+        # KYC and admin sessions are held in process memory.
+        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")),
+                    proxy_headers=True, forwarded_allow_ips="*", log_level="info")
+    else:
+        run_registration_server(host="0.0.0.0", port=5050, ssl=True)
