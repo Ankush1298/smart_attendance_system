@@ -1,172 +1,46 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Smart Class Admin</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/styles.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Smart Attendance</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232457d6'/%3E%3Cpath d='M9 17l5 5 9-11' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/app.css">
 </head>
 <body>
-    <div class="app-container">
-        <!-- Sidebar -->
-        <aside class="sidebar glass">
-            <div class="logo">
-                <h2>🎓 SmartClass</h2>
-            </div>
-            <nav class="nav-menu">
-                <a href="#" class="nav-item active" onclick="showTab('dashboard')">📊 Dashboard</a>
-                <a href="#" class="nav-item" onclick="showTab('cameras')">🎥 Live Cameras</a>
-                <a href="#" class="nav-item" onclick="showTab('timetable')">📅 Timetable</a>
-                <a href="#" class="nav-item" onclick="showTab('reports')">📑 Reports</a>
-            </nav>
-        </aside>
-
-        <!-- Main Content -->
-        <main class="main-content">
-            <header class="topbar glass">
-                <h1>Admin Dashboard</h1>
-                <div class="user-profile">Admin</div>
-            </header>
-
-            <div class="content-area">
-                <!-- Dashboard Tab -->
-                <div id="dashboard" class="tab-content active">
-                    <div class="stats-grid">
-                        <div class="stat-card glass">
-                            <h3>Total Students</h3>
-                            <div class="stat-value" id="stat-students">--</div>
-                        </div>
-                        <div class="stat-card glass">
-                            <h3>Total Teachers</h3>
-                            <div class="stat-value" id="stat-teachers">--</div>
-                        </div>
-                        <div class="stat-card glass">
-                            <h3>Monitored Rooms</h3>
-                            <div class="stat-value" id="stat-rooms">--</div>
-                        </div>
-                        <div class="stat-card glass">
-                            <h3>Active Classes</h3>
-                            <div class="stat-value" id="stat-active">--</div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Live Cameras Tab -->
-                <div id="cameras" class="tab-content">
-                    <div class="cameras-grid" id="cameras-grid">
-                        <!-- Camera feeds injected here -->
-                    </div>
-                </div>
-
-                <!-- Timetable Tab -->
-                <div id="timetable" class="tab-content">
-                    <div class="card glass upload-card">
-                        <h2>Upload Timetable (CSV)</h2>
-                        <p>CSV must contain: room_id, teacher_id, subject, day_of_week, start_time, end_time</p>
-                        <form id="uploadForm">
-                            <input type="file" id="csvFile" accept=".csv" required>
-                            <button type="submit" class="btn primary">Upload Timetable</button>
-                        </form>
-                        <div id="uploadStatus"></div>
-                    </div>
-                    
-                    <div class="card glass mt-4">
-                        <h2>Current Schedule</h2>
-                        <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th>Subject</th>
-                                    <th>Room</th>
-                                    <th>Teacher</th>
-                                    <th>Day</th>
-                                    <th>Time</th>
-                                </tr>
-                            </thead>
-                            <tbody id="timetable-body">
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <!-- Reports Tab -->
-                <div id="reports" class="tab-content">
-                    <div class="card glass">
-                        <h2>Attendance Reports</h2>
-                        <p>Feature coming soon...</p>
-                    </div>
-                </div>
-            </div>
-        </main>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div id="app" class="app" hidden>
+    <aside id="sidebar" class="sidebar" aria-label="Primary">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">Smart Attendance</span>
+      </div>
+      <nav id="nav" class="nav"></nav>
+      <div class="sidebar-foot">
+        <div id="engine-pill" class="engine-pill" role="status"></div>
+      </div>
+    </aside>
+    <div class="scrim" id="scrim" hidden></div>
+    <div class="content">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"></button>
+        <h1 id="page-title" class="page-title" tabindex="-1">Dashboard</h1>
+        <div class="topbar-right">
+          <button class="icon-btn" id="theme-btn" aria-label="Toggle dark mode"></button>
+          <div class="user">
+            <span id="user-name" class="user-name"></span>
+            <button class="btn btn-ghost btn-sm" id="logout-btn" type="button">Sign out</button>
+          </div>
+        </div>
+      </header>
+      <div id="banner" class="banner-area" role="region" aria-label="System status"></div>
+      <main id="main" class="main" tabindex="-1"></main>
     </div>
-
-    <script>
-        // Tab Navigation
-        function showTab(tabId) {
-            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-            document.getElementById(tabId).classList.add('active');
-            event.target.classList.add('active');
-        }
-
-        // Fetch Stats
-        async function loadStats() {
-            try {
-                const res = await fetch('/api/stats');
-                const data = await res.json();
-                document.getElementById('stat-students').innerText = data.students;
-                document.getElementById('stat-teachers').innerText = data.teachers;
-                document.getElementById('stat-rooms').innerText = data.rooms;
-                document.getElementById('stat-active').innerText = data.active_classes;
-            } catch (e) {
-                console.error(e);
-            }
-        }
-
-        // Fetch Timetable
-        async function loadTimetable() {
-            try {
-                const res = await fetch('/api/timetable');
-                const data = await res.json();
-                const tbody = document.getElementById('timetable-body');
-                tbody.textContent = '';
-                data.forEach(t => {
-                    const tr = document.createElement('tr');
-                    [t.subject, t.room_name, t.teacher_name || t.teacher_id, t.day_of_week, `${t.start_time} - ${t.end_time}`].forEach(value => {
-                        const td = document.createElement('td');
-                        td.textContent = value ?? '';
-                        tr.appendChild(td);
-                    });
-                    tbody.appendChild(tr);
-                });
-            } catch (e) {
-                console.error(e);
-            }
-        }
-
-        // Upload Timetable
-        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const file = document.getElementById('csvFile').files[0];
-            const formData = new FormData();
-            formData.append('file', file);
-            
-            try {
-                const res = await fetch('/api/timetable/upload', {
-                    method: 'POST',
-                    body: formData
-                });
-                const data = await res.json();
-                document.getElementById('uploadStatus').innerText = data.status === 'success' ? `Uploaded ${data.rows_inserted} classes!` : `Error: ${data.detail}`;
-                loadTimetable();
-            } catch (e) {
-                document.getElementById('uploadStatus').innerText = "Upload failed.";
-            }
-        });
-
-        // Init
-        loadStats();
-        loadTimetable();
-    </script>
+  </div>
+  <div id="login" class="login" hidden></div>
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+  <noscript><p class="noscript">Smart Attendance needs JavaScript enabled.</p></noscript>
+  <script type="module" src="js/main.js"></script>
 </body>
 </html>

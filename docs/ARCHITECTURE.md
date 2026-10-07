@@ -75,10 +75,25 @@ A practical two-person split is:
 
 Coordinate shared schema changes through pull requests and update `database/schema_mysql.sql` whenever the database contract changes.
 
-## Dwell-time attendance and teacher presence
+## Attendance engine (v3)
 
-Active classroom sessions use a 60-second recognition heartbeat. Student attendance is no longer calculated as `number_of_samples * 5 minutes`. Each successful student detection contributes a short presence interval around its timestamp, and the final attendance duration is the union of those intervals. This prevents a 1-minute late arrival or 1-minute early departure from losing an entire five-minute block.
+```
+server.py ─ uvicorn ─ FastAPI (backend/api) ─ Store (backend/core/store.py) ─┐
+                │                                                           ├─ MySQL (pooled, retrying, UTC session)
+                └ SessionLogic (scheduler thread + room workers) ───────────┘
+                     ├ CameraManager  → one reader thread per in-use camera (reconnect/backoff, frozen/black-frame detection)
+                     ├ Recognizer     → FaceRecognizer (InsightFace) - replaceable interface
+                     ├ SessionStateMachine (explicit, validated transitions, persisted in session_events)
+                     └ attendance_math (pure functions: counted window, dwell intervals, camera holes, absence runs)
+```
 
-Teacher attendance is a separate rule: for a 50-minute lecture, only the middle 40 minutes (`start + 5 min` through `end - 5 min`) count. The scheduled teacher must be detected in the room's configured normalized front/whiteboard zone. The teacher can authorize the session before the five-minute counted window; continuous recognition is not required for authorization, but the 60-second heartbeat tracks later presence. A continuous absence gap greater than 20 minutes is flagged for HOD/management reporting.
+* `backend/core/attendance_math.py` – pure arithmetic, fully unit-tested.
+* `backend/core/session_state.py` – states and legal transitions.
+* `backend/core/session_logic.py` – scheduling, teacher authorization, scan cycle, outage handling, finalization.
+* `backend/core/store.py` – every v3 table (cameras, sections, events, holes, flags, summaries, drafts) and the transactional finalization.
+* `backend/database/migrations.py` – versioned, idempotent, non-destructive migrations (`schema_migrations`).
+* `frontend/admin/` – dependency-free ES-module single-page app (no build step), served by the API.
 
-Each room can configure the teacher zone as normalized `x1,y1,x2,y2` values in the Cameras & Rooms screen. The safe default is the full frame so existing room/camera configurations keep working until a front/whiteboard zone is configured.
+Persistence rules: all new timestamps are UTC `DATETIME`; sessions, recognition events and attendance rows are idempotent (unique keys + upserts); finalization of a session is one transaction guarded by `finalized_at`.
+
+The desktop UI, KYC registration portal and Flask portal keep using `DatabaseManager` and the same schema.

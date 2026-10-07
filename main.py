@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 
 # Load environment configuration
 load_dotenv(Path(__file__).parent / ".env")
-
+from backend.core.logging_setup import setup_logging
 from backend.core.db import DatabaseManager
 from backend.core.face_core import FaceEngine
 from backend.core.session_logic import SessionLogic
@@ -16,6 +16,7 @@ def start_engine(engine: FaceEngine):
     engine.load_async()
 
 if __name__ == "__main__":
+    setup_logging()
     BASE_DIR = Path(__file__).parent
     MODELS_DIR = BASE_DIR / "models"
     DB_PATH = BASE_DIR  # DatabaseManager uses MySQL; retained only for API compatibility.

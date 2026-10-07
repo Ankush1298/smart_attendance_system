@@ -40,6 +40,8 @@ except ImportError:
     INSIGHTFACE_AVAILABLE = False
 
 from backend.core.db import DatabaseManager
+import logging
+log = logging.getLogger("smart_attendance.register")
 from kyc_core import STEPS, FACE_MODEL, head_pose, check_duplicate_face, KYCSession
 
 
@@ -57,15 +59,15 @@ class RegistrationFaceEngine:
                 self.app = FaceAnalysis(name=FACE_MODEL, root=models_dir, providers=["CPUExecutionProvider"])
                 self.app.prepare(ctx_id=0, det_size=(640, 640))
                 self.ready = True
-                print(f"[INFO] InsightFace {FACE_MODEL} initialized for KYC Registration.")
+                log.info(f"InsightFace {FACE_MODEL} initialized for KYC Registration.")
             except Exception as e:
-                print(f"[WARN] InsightFace init fallback: {e}")
+                log.warning(f"InsightFace init fallback: {e}")
                 try:
                     self.app = FaceAnalysis(name=FACE_MODEL, providers=["CPUExecutionProvider"])
                     self.app.prepare(ctx_id=0, det_size=(640, 640))
                     self.ready = True
                 except Exception as e2:
-                    print(f"[ERROR] Could not load InsightFace: {e2}")
+                    log.error(f"Could not load InsightFace: {e2}")
 
     def analyze(self, img_bgr):
         if not self.ready or self.app is None:
@@ -538,9 +540,28 @@ async function startCamera() {{
   }}
 }}
 
+// Full-quality frames are big, so a single request at a time caps the scan at ~1-2 fps on a phone or
+// ngrok. Keep two uploads in flight (encode the next frame while the previous one is travelling); the
+// server drops frames that arrive out of order, and we only render the newest reply.
+let inflight = 0, seqCounter = 0, lastRenderedSeq = 0;
+async function sendFrame(blob, mySeq) {{
+  const fd = new FormData();
+  fd.append('session_id', SID);
+  fd.append('seq', String(mySeq));
+  fd.append('frame', blob, 'f.jpg');
+  try {{
+    const r = await fetch('/api/frame', {{method: 'POST', body: fd}});
+    if (!r.ok) {{ showError('Server error while scanning (HTTP ' + r.status + '). Check the server log.'); }}
+    else {{
+      const data = await r.json();
+      if (mySeq >= lastRenderedSeq) {{ lastRenderedSeq = mySeq; render(data); }}
+    }}
+  }} catch (e) {{ console.warn('frame upload failed', e); }}
+}}
+
 async function frameLoop() {{
   while (cameraActive) {{
-    if (video.videoWidth) {{
+    if (video.videoWidth && inflight < 2) {{
       // Use the camera's own native resolution for the square crop,
       // instead of forcing everything down to a fixed 320x320 -- the
       // saved face embeddings come straight from this frame, so a
@@ -551,16 +572,10 @@ async function frameLoop() {{
       if (grab.width !== s) {{ grab.width = s; grab.height = s; }}
       gctx.drawImage(video, (video.videoWidth - nativeSide) / 2, (video.videoHeight - nativeSide) / 2, nativeSide, nativeSide, 0, 0, s, s);
       const blob = await new Promise(r => grab.toBlob(r, 'image/jpeg', 0.96));
-      const fd = new FormData();
-      fd.append('session_id', SID);
-      fd.append('frame', blob, 'f.jpg');
-      try {{
-        const r = await fetch('/api/frame', {{method: 'POST', body: fd}});
-        if (!r.ok) {{ showError('Server error while scanning (HTTP ' + r.status + '). Check the server log.'); }}
-        else {{ render(await r.json()); }}
-      }} catch (e) {{ console.warn('frame upload failed', e); }}
+      inflight++;
+      sendFrame(blob, ++seqCounter).finally(() => {{ inflight--; }});
     }}
-    await new Promise(r => setTimeout(r, 90));
+    await new Promise(r => setTimeout(r, inflight >= 2 ? 15 : 0));
   }}
 }}
 
@@ -749,7 +764,7 @@ def faculty_portal():
 
 
 @app.post("/api/frame")
-def api_frame(session_id: str = Form(...), frame: UploadFile = File(...)):
+def api_frame(session_id: str = Form(...), frame: UploadFile = File(...), seq: int = Form(0)):
     sess = manager.get(session_id)
     if sess is None:
         return JSONResponse(content={
@@ -759,19 +774,21 @@ def api_frame(session_id: str = Form(...), frame: UploadFile = File(...)):
         })
     # Accept up to 8MB per frame (original quality 1280x1280 JPEG can be ~1-3MB)
     raw = frame.file.read(8_000_000)
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-    if img is not None:
-        h, w = img.shape[:2]
-        side = min(h, w)
-        y0, x0 = (h - side) // 2, (w - side) // 2
-        img = img[y0:y0 + side, x0:x0 + side]
-        faces = manager.analyze(img)
-        try:
-            sess.process(faces, side)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[ERROR] KYC frame processing failed: {e}")
+    with sess.frame_lock:                      # two uploads may overlap; process them in order
+        if seq and seq <= sess.last_seq:       # older than a frame already handled: skip the work
+            return JSONResponse(content=sess.status())
+        sess.last_seq = max(sess.last_seq, seq)
+        img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+        if img is not None:
+            h, w = img.shape[:2]
+            side = min(h, w)
+            y0, x0 = (h - side) // 2, (w - side) // 2
+            img = img[y0:y0 + side, x0:x0 + side]
+            faces = manager.analyze(img)
+            try:
+                sess.process(faces, side)
+            except Exception as e:
+                log.exception("KYC frame processing failed")
     return JSONResponse(content=sess.status())
 
 
@@ -1249,7 +1266,7 @@ def _ensure_local_certificate() -> tuple[Path, Path]:
         cert_file.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
         return cert_file, key_file
     except Exception as exc:
-        print(f"[KYC Server] Could not create local TLS certificate: {exc}")
+        log.warning(f"Could not create local TLS certificate: {exc}")
         return cert_file, key_file
 
 
@@ -1257,9 +1274,9 @@ def run_registration_server(host: str = "0.0.0.0", port: int = 5050, ssl: bool =
     cert_file, key_file = _ensure_local_certificate() if ssl else (Path(""), Path(""))
     use_ssl = ssl and cert_file.exists() and key_file.exists()
     scheme = "https" if use_ssl else "http"
-    print(f"\n[KYC Server] Starting Registration Server on {scheme}://{host}:{port}")
-    print(f"[KYC Server] 🎓 Student Portal: {scheme}://{host}:{port}/student")
-    print(f"[KYC Server] 👨‍🏫 Faculty Portal: {scheme}://{host}:{port}/teacher")
+    log.info(f"Starting Registration Server on {scheme}://{host}:{port}")
+    log.info(f"🎓 Student Portal: {scheme}://{host}:{port}/student")
+    log.info(f"👨‍🏫 Faculty Portal: {scheme}://{host}:{port}/teacher")
 
     if use_ssl:
         config = uvicorn.Config(
